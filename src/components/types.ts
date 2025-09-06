@@ -1,4 +1,4 @@
-import {StyleProp, type TextStyle, type TextProps} from 'react-native';
+import type {StyleProp, TextStyle, TextProps} from 'react-native';
 
 /**
  * Data passed to the `onHighlightedPress` callback

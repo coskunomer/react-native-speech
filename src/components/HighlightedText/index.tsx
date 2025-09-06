@@ -56,7 +56,7 @@ const HighlightedText: React.FC<HighlightedTextProps> = ({
     (isHighlighted = false, segmentStyle?: StyleProp<TextStyle>) => {
       return !isHighlighted
         ? style
-        : StyleSheet.flatten<TextStyle>([
+        : StyleSheet.flatten([
             style,
             highlightedStyle ?? styles.isHighlighted,
             segmentStyle,

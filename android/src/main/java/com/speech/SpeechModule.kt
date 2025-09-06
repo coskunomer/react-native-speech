@@ -11,6 +11,7 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.bridge.ReadableMap
+import com.facebook.fbreact.specs.NativeSpeechSpec
 import android.speech.tts.UtteranceProgressListener
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.module.annotations.ReactModule
@@ -37,15 +38,11 @@ class SpeechModule(reactContext: ReactApplicationContext) :
   private val queueLock = Any()
 
   private val isSupportedPausing = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-
   private lateinit var synthesizer: TextToSpeech
-
   private var isInitialized = false
   private var isInitializing = false
   private val pendingOperations = mutableListOf<Pair<() -> Unit, Promise>>()
-
   private var globalOptions: MutableMap<String, Any> = defaultOptions.toMutableMap()
-
   private var isPaused = false
   private var isResuming = false
   private var currentQueueIndex = -1
@@ -82,7 +79,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
     return params
   }
 
-  private fun getEventData(utteranceId: String): WritableMap {
+  private fun getEventData(utteranceId: String): ReadableMap {
     return Arguments.createMap().apply {
       putInt("id", utteranceId.hashCode())
     }
@@ -175,7 +172,8 @@ class SpeechModule(reactContext: ReactApplicationContext) :
             synchronized(queueLock) {
               speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
                 item.position = item.offset + start
-                val data = getEventData(utteranceId).apply {
+                val data = Arguments.createMap().apply {
+                  putInt("id", utteranceId.hashCode())
                   putInt("length", end - start)
                   putInt("location", item.position)
                 }
