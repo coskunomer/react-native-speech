@@ -146,6 +146,16 @@ RCT_EXPORT_MODULE();
   resolve(voicesArray);
 }
 
+- (void)getEngines:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+  resolve(@[]);
+}
+
+- (void)setEngine:(NSString *)engineName
+          resolve:(RCTPromiseResolveBlock)resolve
+          reject:(RCTPromiseRejectBlock)reject {
+  resolve(nil);
+}
+
 - (void)isSpeaking:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
   BOOL speaking = self.synthesizer.isSpeaking;
   resolve(@(speaking));

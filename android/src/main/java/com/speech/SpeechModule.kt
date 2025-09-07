@@ -38,11 +38,18 @@ class SpeechModule(reactContext: ReactApplicationContext) :
   private val queueLock = Any()
 
   private val isSupportedPausing = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+
   private lateinit var synthesizer: TextToSpeech
+
+  private var selectedEngine: String? = null
+  private var cachedEngines: List<TextToSpeech.EngineInfo>? = null
+
   private var isInitialized = false
   private var isInitializing = false
   private val pendingOperations = mutableListOf<Pair<() -> Unit, Promise>>()
+
   private var globalOptions: MutableMap<String, Any> = defaultOptions.toMutableMap()
+
   private var isPaused = false
   private var isResuming = false
   private var currentQueueIndex = -1
@@ -112,11 +119,12 @@ class SpeechModule(reactContext: ReactApplicationContext) :
     if (isInitializing) return
     isInitializing = true
 
-    synthesizer = TextToSpeech(reactApplicationContext) { status ->
+    synthesizer = TextToSpeech(reactApplicationContext, { status ->
       isInitialized = status == TextToSpeech.SUCCESS
       isInitializing = false
 
       if (isInitialized) {
+        cachedEngines = synthesizer.engines
         synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
           override fun onStart(utteranceId: String) {
             synchronized(queueLock) {
@@ -187,7 +195,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
       } else {
         rejectPendingOperations()
       }
-    }
+    }, selectedEngine)
   }
 
   private fun ensureInitialized(promise: Promise, operation: () -> Unit) {
@@ -223,7 +231,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
     globalOptions["voice"]?.let { voiceId ->
       synthesizer.voices?.forEach { voice ->
         if (voice.name == voiceId) {
-          synthesizer.setVoice(voice)
+          synthesizer.voice = voice
           return@forEach
         }
       }
@@ -247,7 +255,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
     tempOptions["voice"]?.let { voiceId ->
       synthesizer.voices?.forEach { voice ->
         if (voice.name == voiceId) {
-          synthesizer.setVoice(voice)
+          synthesizer.voice = voice
           return@forEach
         }
       }
@@ -443,6 +451,42 @@ class SpeechModule(reactContext: ReactApplicationContext) :
     }
   }
 
+  override fun getEngines(promise: Promise) {
+    ensureInitialized(promise) {
+      val enginesArray = Arguments.createArray()
+      cachedEngines?.forEach { engine ->
+        enginesArray.pushMap(
+          Arguments.createMap().apply {
+            putString("name", engine.name)
+            putString("label", engine.label)
+            putBoolean("isDefault", engine.name == synthesizer.defaultEngine)
+          }
+        )
+      }
+      promise.resolve(enginesArray)
+    }
+  }
+
+  override fun setEngine(engineName: String, promise: Promise) {
+    if (cachedEngines?.any { it.name == engineName } == false) {
+      promise.reject("engine_error", "Engine '$engineName' is not available")
+      return
+    }
+    if (isInitialized) {
+      val activeEngine = selectedEngine ?: synthesizer.defaultEngine
+      if (activeEngine == engineName) {
+        promise.resolve(null)
+        return
+      }
+    }
+    selectedEngine = engineName
+
+    invalidate()
+
+    pendingOperations.add(Pair({ promise.resolve(null) }, promise))
+    initializeTTS()
+  }
+
   override fun invalidate() {
     super.invalidate()
     if (::synthesizer.isInitialized) {
@@ -450,5 +494,6 @@ class SpeechModule(reactContext: ReactApplicationContext) :
       synthesizer.shutdown()
       resetQueueState()
     }
+    isInitialized = false
   }
 }

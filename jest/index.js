@@ -20,6 +20,8 @@ class Speech {
   static isSpeaking = mockPromiseBool;
   static speakWithOptions = mockPromise;
   static getAvailableVoices = mockPromiseArr;
+  static getEngines = mockPromiseArr;
+  static setEngine = mockPromise;
   static onError = eventMock;
   static onStart = eventMock;
   static onFinish = eventMock;

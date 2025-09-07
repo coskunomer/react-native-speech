@@ -58,7 +58,21 @@ export interface VoiceOptions {
    */
   rate?: number;
 }
-
+export interface EngineProps {
+  /**
+   * The unique system identifier for the engine.
+   * This is typically the package name (e.g., "com.google.android.tts")
+   */
+  name: string;
+  /**
+   * The human-readable display name for the engine (e.g., "Google Text-to-Speech Engine").
+   */
+  label: string;
+  /**
+   * A boolean flag indicating if this is the default engine
+   */
+  isDefault: boolean;
+}
 export interface Spec extends TurboModule {
   reset: () => void;
   stop: () => Promise<void>;
@@ -66,7 +80,9 @@ export interface Spec extends TurboModule {
   resume: () => Promise<boolean>;
   isSpeaking: () => Promise<boolean>;
   speak: (text: string) => Promise<void>;
+  getEngines: () => Promise<EngineProps[]>;
   initialize: (options: VoiceOptions) => void;
+  setEngine: (engineName: string) => Promise<void>;
   getAvailableVoices: (language: string) => Promise<VoiceProps[]>;
   speakWithOptions: (text: string, options: VoiceOptions) => Promise<void>;
 

@@ -1,5 +1,5 @@
 import TurboSpeech from './NativeSpeech';
-import type {VoiceProps, VoiceOptions} from './NativeSpeech';
+import type {VoiceProps, VoiceOptions, EngineProps} from './NativeSpeech';
 
 export default class Speech {
   /**
@@ -17,6 +17,38 @@ export default class Speech {
    */
   public static getAvailableVoices(language?: string): Promise<VoiceProps[]> {
     return TurboSpeech.getAvailableVoices(language ?? '');
+  }
+  /**
+   * Gets a list of all available text-to-speech engines on the device
+   * @returns Promise<EngineProps[]> Array of engine properties including name, label, and isDefault flag
+   * @platform android
+   * @example
+   * const engines = await Speech.getEngines();
+   * engines.forEach(engine => {
+   *   console.log(`Engine: ${engine.label} (${engine.name})`);
+   *   if (engine.isDefault) {
+   *     console.log('This is the default engine');
+   *   }
+   * });
+   */
+  public static getEngines(): Promise<EngineProps[]> {
+    return TurboSpeech.getEngines();
+  }
+  /**
+   * Sets the text-to-speech engine to use for speech synthesis
+   * @param engineName - The name of the engine to use (obtained from getEngines())
+   * @returns Promise<void> Resolves when engine is set
+   * @platform android
+   * @example
+   * // First, get available engines
+   * const engines = await Speech.getEngines();
+   * // Then set a specific engine
+   * await Speech.setEngine(engines[0].name);
+   * // Or set by known engine name
+   * await Speech.setEngine('com.google.android.tts');
+   */
+  public static setEngine(engineName: string): Promise<void> {
+    return TurboSpeech.setEngine(engineName);
   }
   /**
    * Sets the global options for all subsequent speak() calls

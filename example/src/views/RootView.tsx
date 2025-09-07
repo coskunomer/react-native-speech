@@ -69,6 +69,13 @@ const RootView: React.FC = () => {
     //   });
     // })();
 
+    // (async () => {
+    //   const engines = await Speech.getEngines();
+    //   if (engines?.[0]) {
+    //     await Speech.setEngine(engines[0].name);
+    //   }
+    // })();
+
     return () => {
       startSubscription.remove();
       finishSubscription.remove();
