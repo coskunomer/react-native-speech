@@ -22,6 +22,8 @@ const RootView: React.FC = () => {
   >([]);
 
   React.useEffect(() => {
+    // Speech.initialize({silentMode: 'ignore'});
+
     const onSpeechEnd = () => {
       setIsStarted(false);
       setIsPaused(false);

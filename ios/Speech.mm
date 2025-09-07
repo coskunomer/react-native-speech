@@ -23,6 +23,7 @@ RCT_EXPORT_MODULE();
     defaultOptions = @{
       @"pitch": @(1.0),
       @"volume": @(1.0),
+      @"silentMode": @"obey",
       @"rate": @(AVSpeechUtteranceDefaultSpeechRate),
       @"language": [AVSpeechSynthesisVoice currentLanguageCode] ?: @"en-US"
     };
@@ -30,6 +31,20 @@ RCT_EXPORT_MODULE();
     self.globalOptions = [defaultOptions copy];
   }
   return self;
+}
+
+- (void)configureAudioSessionWithOptions:(NSDictionary *)options {
+  NSError *error = nil;
+  NSString *silentMode = options[@"silentMode"] ?: @"obey";
+
+  if ([silentMode isEqualToString:@"ignore"]) {
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&error];
+  } else if ([silentMode isEqualToString:@"respect"]) {
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryAmbient error:&error];
+  }
+  if (error) {
+    NSLog(@"[Speech] AVAudioSession setCategory error: %@", error.localizedDescription);
+  }
 }
 
 - (NSDictionary *)getEventData:(AVSpeechUtterance *)utterance {
@@ -55,6 +70,9 @@ RCT_EXPORT_MODULE();
   }
   if (options.language()) {
     validatedOptions[@"language"] = options.language();
+  }
+  if (options.silentMode()) {
+    validatedOptions[@"silentMode"] = options.silentMode();
   }
   if (options.pitch()) {
     float pitch = MAX(0.5, MIN(2.0, options.pitch().value()));
@@ -105,7 +123,7 @@ RCT_EXPORT_MODULE();
 
 - (void)getAvailableVoices:(NSString *)language
                   resolve:(RCTPromiseResolveBlock)resolve
-                  reject:(RCTPromiseRejectBlock)reject 
+                  reject:(RCTPromiseRejectBlock)reject
 {
   NSMutableArray *voicesArray = [NSMutableArray new];
   NSArray *speechVoices = [AVSpeechSynthesisVoice speechVoices];
@@ -170,6 +188,8 @@ RCT_EXPORT_MODULE();
   AVSpeechUtterance *utterance;
  
   @try {
+    [self configureAudioSessionWithOptions:self.globalOptions];
+
     utterance = [self getDefaultUtterance:text];
     [self.synthesizer speakUtterance:utterance];
     resolve(nil);
@@ -193,17 +213,18 @@ RCT_EXPORT_MODULE();
   AVSpeechUtterance *utterance;
 
   @try {
-    utterance = [self getDefaultUtterance:text];
     NSDictionary *validatedOptions = [self getValidatedOptions:options];
+    [self configureAudioSessionWithOptions:validatedOptions];
+    
+    utterance = [self getDefaultUtterance:text];
 
     if (validatedOptions[@"voice"]) {
       AVSpeechSynthesisVoice *voice = [AVSpeechSynthesisVoice voiceWithIdentifier:validatedOptions[@"voice"]];
-      
       if (voice) {
         utterance.voice = voice;
-      } else if (validatedOptions[@"language"]) {
-        utterance.voice = [AVSpeechSynthesisVoice voiceWithLanguage:validatedOptions[@"language"]];
       }
+    } else if (validatedOptions[@"language"]) {
+      utterance.voice = [AVSpeechSynthesisVoice voiceWithLanguage:validatedOptions[@"language"]];
     }
     if (validatedOptions[@"pitch"]) {
       utterance.pitchMultiplier = [validatedOptions[@"pitch"] floatValue];
@@ -224,7 +245,7 @@ RCT_EXPORT_MODULE();
   }
 }
 
-- (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer 
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer
   didStartSpeechUtterance:(AVSpeechUtterance *)utterance {
   [self emitOnStart:[self getEventData:utterance]];
 }

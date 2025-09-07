@@ -30,6 +30,15 @@ export interface VoiceProps {
   identifier: string;
 }
 export interface VoiceOptions {
+  /**
+   * Determines how speech audio should behave with the iOS silent switch (ringer)
+   * @platform ios
+   *
+   * - `obey`: (Default) The library does not change the app's audio session. Speech audio will follow the app's current audio configuration or the system default
+   * - `respect`: Speech audio will be silenced by the ringer switch. This is for non-critical speech
+   * - `ignore`: Speech audio will play even if the ringer switch is on silent. Use this for critical speech like navigation
+   */
+  silentMode?: 'obey' | 'respect' | 'ignore';
   /** The language code to use (e.g., 'en', 'fr', 'en-US', 'fr-FR') */
   language?: string;
   /** Volume level from 0.0 to 1.0 */
