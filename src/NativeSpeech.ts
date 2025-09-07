@@ -1,7 +1,7 @@
 import {TurboModuleRegistry, type TurboModule} from 'react-native';
 import type {EventEmitter} from 'react-native/Libraries/Types/CodegenTypesNamespace';
 
-export type VocieQuality = 'Default' | 'Enhanced';
+export type VoiceQuality = 'Default' | 'Enhanced';
 
 export interface EventProps {
   /**
@@ -23,7 +23,7 @@ export interface VoiceProps {
   /** The name of the voice */
   name: string;
   /** The quality level of the voice */
-  quality: VocieQuality;
+  quality: VoiceQuality;
   /** The language code of the voice (e.g., 'en-US', 'fr-FR') */
   language: string;
   /** The unique identifier for the voice */
