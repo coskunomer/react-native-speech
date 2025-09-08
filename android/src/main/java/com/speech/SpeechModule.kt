@@ -263,9 +263,10 @@ class SpeechModule(reactContext: ReactApplicationContext) :
   }
 
   private fun getValidatedOptions(options: ReadableMap): Map<String, Any> {
-    val validated = mutableMapOf<String, Any>()
+    val validated = globalOptions.toMutableMap()
+
     if (options.hasKey("voice")) {
-      validated["voice"] = options.getString("voice") ?: ""
+      options.getString("voice")?.let { validated["voice"] = it }
     }
     if (options.hasKey("language")) {
       validated["language"] = options.getString("language")

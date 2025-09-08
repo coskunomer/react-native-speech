@@ -33,9 +33,8 @@ RCT_EXPORT_MODULE();
   return self;
 }
 
-- (void)configureAudioSessionWithOptions:(NSDictionary *)options {
+- (void)configureSilentModeSession:(NSString *)silentMode {
   NSError *error = nil;
-  NSString *silentMode = options[@"silentMode"] ?: @"obey";
 
   if ([silentMode isEqualToString:@"ignore"]) {
     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&error];
@@ -63,8 +62,8 @@ RCT_EXPORT_MODULE();
 }
 
 - (NSDictionary *)getValidatedOptions:(VoiceOptions &)options {
-  NSMutableDictionary *validatedOptions = [NSMutableDictionary new];
-  
+  NSMutableDictionary *validatedOptions = [self.globalOptions mutableCopy];
+
   if (options.voice()) {
     validatedOptions[@"voice"] = options.voice();
   }
@@ -90,22 +89,20 @@ RCT_EXPORT_MODULE();
   return validatedOptions;
 }
 
-- (AVSpeechUtterance *)getDefaultUtterance:(NSString *)text {
+- (AVSpeechUtterance *)getUtterance:(NSString *)text withOptions:(NSDictionary *)options {
   AVSpeechUtterance *utterance = [[AVSpeechUtterance alloc] initWithString:text];
-  
-  if (self.globalOptions[@"voice"]) {
-    AVSpeechSynthesisVoice *voice = [AVSpeechSynthesisVoice voiceWithIdentifier:self.globalOptions[@"voice"]];
+
+  if (options[@"voice"]) {
+    AVSpeechSynthesisVoice *voice = [AVSpeechSynthesisVoice voiceWithIdentifier:options[@"voice"]];
     if (voice) {
       utterance.voice = voice;
-    } else if (self.globalOptions[@"language"]) {
-      utterance.voice = [AVSpeechSynthesisVoice voiceWithLanguage:self.globalOptions[@"language"]];
     }
-  } else {
-    utterance.voice = [AVSpeechSynthesisVoice voiceWithLanguage:self.globalOptions[@"language"]];
+  } else if (options[@"language"]) {
+    utterance.voice = [AVSpeechSynthesisVoice voiceWithLanguage:options[@"language"]];
   }
-  utterance.rate = [self.globalOptions[@"rate"] floatValue];
-  utterance.volume = [self.globalOptions[@"volume"] floatValue];
-  utterance.pitchMultiplier = [self.globalOptions[@"pitch"] floatValue];
+  utterance.rate = [options[@"rate"] floatValue];
+  utterance.volume = [options[@"volume"] floatValue];
+  utterance.pitchMultiplier = [options[@"pitch"] floatValue];
 
   return utterance;
 }
@@ -123,7 +120,7 @@ RCT_EXPORT_MODULE();
 
 - (void)getAvailableVoices:(NSString *)language
                   resolve:(RCTPromiseResolveBlock)resolve
-                  reject:(RCTPromiseRejectBlock)reject
+                   reject:(RCTPromiseRejectBlock)reject
 {
   NSMutableArray *voicesArray = [NSMutableArray new];
   NSArray *speechVoices = [AVSpeechSynthesisVoice speechVoices];
@@ -132,9 +129,7 @@ RCT_EXPORT_MODULE();
     NSString *lowercaseLanguage = [language lowercaseString];
     
     for (AVSpeechSynthesisVoice *voice in speechVoices) {
-      NSString *voiceLanguage = [voice.language lowercaseString];
-
-      if ([voiceLanguage hasPrefix:lowercaseLanguage]) {
+      if ([[voice.language lowercaseString] hasPrefix:lowercaseLanguage]) {
         [voicesArray addObject:[self getVoiceItem:voice]];
       }
     }
@@ -152,13 +147,12 @@ RCT_EXPORT_MODULE();
 
 - (void)setEngine:(NSString *)engineName
           resolve:(RCTPromiseResolveBlock)resolve
-          reject:(RCTPromiseRejectBlock)reject {
+           reject:(RCTPromiseRejectBlock)reject {
   resolve(nil);
 }
 
 - (void)isSpeaking:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
-  BOOL speaking = self.synthesizer.isSpeaking;
-  resolve(@(speaking));
+  resolve(@(self.synthesizer.isSpeaking));
 }
 
 - (void)stop:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
@@ -198,9 +192,9 @@ RCT_EXPORT_MODULE();
   AVSpeechUtterance *utterance;
  
   @try {
-    [self configureAudioSessionWithOptions:self.globalOptions];
+    [self configureSilentModeSession:self.globalOptions[@"silentMode"]];
 
-    utterance = [self getDefaultUtterance:text];
+    utterance = [self getUtterance:text withOptions:self.globalOptions];
     [self.synthesizer speakUtterance:utterance];
     resolve(nil);
   }
@@ -224,28 +218,9 @@ RCT_EXPORT_MODULE();
 
   @try {
     NSDictionary *validatedOptions = [self getValidatedOptions:options];
-    [self configureAudioSessionWithOptions:validatedOptions];
+    [self configureSilentModeSession:validatedOptions[@"silentMode"]];
     
-    utterance = [self getDefaultUtterance:text];
-
-    if (validatedOptions[@"voice"]) {
-      AVSpeechSynthesisVoice *voice = [AVSpeechSynthesisVoice voiceWithIdentifier:validatedOptions[@"voice"]];
-      if (voice) {
-        utterance.voice = voice;
-      }
-    } else if (validatedOptions[@"language"]) {
-      utterance.voice = [AVSpeechSynthesisVoice voiceWithLanguage:validatedOptions[@"language"]];
-    }
-    if (validatedOptions[@"pitch"]) {
-      utterance.pitchMultiplier = [validatedOptions[@"pitch"] floatValue];
-    }
-    if (validatedOptions[@"volume"]) {
-      utterance.volume = [validatedOptions[@"volume"] floatValue];
-    }
-    if (validatedOptions[@"rate"]) {
-      utterance.rate = [validatedOptions[@"rate"] floatValue];
-    }
-
+    utterance = [self getUtterance:text withOptions:validatedOptions];
     [self.synthesizer speakUtterance:utterance];
     resolve(nil);
   }
