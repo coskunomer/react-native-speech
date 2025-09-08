@@ -31,12 +31,19 @@ export interface VoiceProps {
 }
 export interface VoiceOptions {
   /**
-   * Determines how speech audio should behave with the iOS silent switch (ringer)
+   * If `true`, audio from other apps will be temporarily lowered (ducked) while speech is active.
+   * This is for critical announcements (e.g., navigation) and takes priority over `silentMode` on iOS.
+   * @default false
+   */
+  ducking?: boolean;
+  /**
+   * Determines how speech audio interacts with the device's silent (ringer) switch.
+   * This option is ignored if `ducking` is `true`.
    * @platform ios
    *
-   * - `obey`: (Default) The library does not change the app's audio session. Speech audio will follow the app's current audio configuration or the system default
-   * - `respect`: Speech audio will be silenced by the ringer switch. This is for non-critical speech
-   * - `ignore`: Speech audio will play even if the ringer switch is on silent. Use this for critical speech like navigation
+   * - `obey`: (Default) Does not change the app's audio session. Speech follows the system default.
+   * - `respect`: Speech will be silenced by the ringer switch. Use for non-critical audio.
+   * - `ignore`: Speech will play even if the ringer is off. Use for critical audio when ducking is not desired.
    */
   silentMode?: 'obey' | 'respect' | 'ignore';
   /** The language code to use (e.g., 'en', 'fr', 'en-US', 'fr-FR') */

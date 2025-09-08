@@ -4,6 +4,7 @@ using namespace JS::NativeSpeech;
 
 @implementation Speech
 {
+  BOOL isDucking;
   NSDictionary *defaultOptions;
 }
 
@@ -19,25 +20,65 @@ RCT_EXPORT_MODULE();
   if (self) {
     _synthesizer = [[AVSpeechSynthesizer alloc] init];
     _synthesizer.delegate = self;
-    
+
     defaultOptions = @{
       @"pitch": @(1.0),
       @"volume": @(1.0),
+      @"ducking": @(NO),
       @"silentMode": @"obey",
       @"rate": @(AVSpeechUtteranceDefaultSpeechRate),
       @"language": [AVSpeechSynthesisVoice currentLanguageCode] ?: @"en-US"
     };
-    
     self.globalOptions = [defaultOptions copy];
   }
   return self;
 }
 
-- (void)configureSilentModeSession:(NSString *)silentMode {
+- (void)activateDuckingSession {
+  if (!isDucking) {
+    return;
+  }
   NSError *error = nil;
+  AVAudioSession *session = [AVAudioSession sharedInstance];
 
+  [session setCategory:AVAudioSessionCategoryPlayback
+            mode:AVAudioSessionModeSpokenAudio
+            options:AVAudioSessionCategoryOptionDuckOthers
+                  error:&error];
+  if (error) {
+    NSLog(@"[Speech] Failed to set audio session configuration for ducking: %@", error.localizedDescription);
+    return;
+  }
+  [session setActive:YES error:&error];
+  if (error) {
+    NSLog(@"[Speech] Failed to activate audio session for ducking: %@", error.localizedDescription);
+  }
+}
+
+- (void)deactivateDuckingSession {
+  if (!isDucking) {
+    return;
+  }
+  NSError *error = nil;
+  [[AVAudioSession sharedInstance] setActive:NO
+                                 withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                       error:&error];
+
+  if (error) {
+    NSLog(@"[Speech] AVAudioSession setActive (deactivate) error: %@", error.localizedDescription);
+  }
+}
+
+- (void)configureSilentModeSession:(NSString *)silentMode {
+  if (isDucking || [silentMode isEqualToString:@"obey"]) {
+    return;
+  }
+  NSError *error = nil;
   if ([silentMode isEqualToString:@"ignore"]) {
-    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&error];
+     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback
+             mode:AVAudioSessionModeSpokenAudio
+             options:AVAudioSessionCategoryOptionInterruptSpokenAudioAndMixWithOthers
+                   error:&error];
   } else if ([silentMode isEqualToString:@"respect"]) {
     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryAmbient error:&error];
   }
@@ -64,6 +105,9 @@ RCT_EXPORT_MODULE();
 - (NSDictionary *)getValidatedOptions:(VoiceOptions &)options {
   NSMutableDictionary *validatedOptions = [self.globalOptions mutableCopy];
 
+  if (options.ducking()) {
+    validatedOptions[@"ducking"] = @(options.ducking().value());
+  }
   if (options.voice()) {
     validatedOptions[@"voice"] = options.voice();
   }
@@ -165,6 +209,7 @@ RCT_EXPORT_MODULE();
 - (void)pause:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
   if (self.synthesizer.isSpeaking && !self.synthesizer.isPaused) {
     BOOL paused = [self.synthesizer pauseSpeakingAtBoundary:AVSpeechBoundaryImmediate];
+    [self deactivateDuckingSession];
     resolve(@(paused));
   } else {
     resolve(@(false));
@@ -173,6 +218,7 @@ RCT_EXPORT_MODULE();
 
 - (void)resume:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
   if (self.synthesizer.isPaused) {
+    [self activateDuckingSession];
     BOOL resumed = [self.synthesizer continueSpeaking];
     resolve(@(resumed));
   } else {
@@ -192,6 +238,9 @@ RCT_EXPORT_MODULE();
   AVSpeechUtterance *utterance;
  
   @try {
+    isDucking = [self.globalOptions[@"ducking"] boolValue];
+
+    [self activateDuckingSession];
     [self configureSilentModeSession:self.globalOptions[@"silentMode"]];
 
     utterance = [self getUtterance:text withOptions:self.globalOptions];
@@ -199,6 +248,7 @@ RCT_EXPORT_MODULE();
     resolve(nil);
   }
   @catch (NSException *exception) {
+    [self deactivateDuckingSession];
     [self emitOnError:[self getEventData:utterance]];
     reject(@"speech_error", exception.reason, nil);
   }
@@ -218,6 +268,9 @@ RCT_EXPORT_MODULE();
 
   @try {
     NSDictionary *validatedOptions = [self getValidatedOptions:options];
+    isDucking = [validatedOptions[@"ducking"] boolValue];
+
+    [self activateDuckingSession];
     [self configureSilentModeSession:validatedOptions[@"silentMode"]];
     
     utterance = [self getUtterance:text withOptions:validatedOptions];
@@ -225,6 +278,7 @@ RCT_EXPORT_MODULE();
     resolve(nil);
   }
   @catch (NSException *exception) {
+    [self deactivateDuckingSession];
     [self emitOnError:[self getEventData:utterance]];
     reject(@"speech_error", exception.reason, nil);
   }
@@ -246,6 +300,7 @@ RCT_EXPORT_MODULE();
 
 - (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer
   didFinishSpeechUtterance:(AVSpeechUtterance *)utterance {
+  [self deactivateDuckingSession];
   [self emitOnFinish:[self getEventData:utterance]];
 }
 
@@ -261,6 +316,7 @@ RCT_EXPORT_MODULE();
 
 - (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer
   didCancelSpeechUtterance:(AVSpeechUtterance *)utterance {
+  [self deactivateDuckingSession];
   [self emitOnStopped:[self getEventData:utterance]];
 }
 

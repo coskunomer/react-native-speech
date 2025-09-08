@@ -22,7 +22,7 @@ const RootView: React.FC = () => {
   >([]);
 
   React.useEffect(() => {
-    // Speech.initialize({silentMode: 'ignore'});
+    // Speech.initialize({silentMode: 'obey', ducking: true});
 
     const onSpeechEnd = () => {
       setIsStarted(false);

@@ -4,7 +4,11 @@ import java.util.UUID
 import java.util.Locale
 import android.os.Build
 import android.os.Bundle
+import android.content.Context
 import android.speech.tts.Voice
+import android.media.AudioManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.annotation.SuppressLint
 import android.speech.tts.TextToSpeech
 import com.facebook.react.bridge.Promise
@@ -27,11 +31,11 @@ class SpeechModule(reactContext: ReactApplicationContext) :
   companion object {
     const val NAME = "Speech"
 
-    @SuppressLint("ConstantLocale")
     private val defaultOptions: Map<String, Any> = mapOf(
       "rate" to 0.5f,
       "pitch" to 1.0f,
       "volume" to 1.0f,
+      "ducking" to false,
       "language" to Locale.getDefault().toLanguageTag()
     )
   }
@@ -55,8 +59,57 @@ class SpeechModule(reactContext: ReactApplicationContext) :
   private var currentQueueIndex = -1
   private val speechQueue = mutableListOf<SpeechQueueItem>()
 
+  private val audioManager: AudioManager by lazy {
+    reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+  }
+  private var audioFocusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
+  private var audioFocusRequest: AudioFocusRequest? = null
+  private var isDucking = false
+
   init {
     initializeTTS()
+  }
+
+  private fun activateDuckingSession() {
+    if (!isDucking) return
+
+    audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      val audioAttributes = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+        .build()
+      val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+        .setAudioAttributes(audioAttributes)
+        .setOnAudioFocusChangeListener(audioFocusChangeListener!!)
+        .build()
+      audioFocusRequest = focusRequest
+      audioManager.requestAudioFocus(focusRequest)
+    } else {
+      @Suppress("DEPRECATION")
+      audioManager.requestAudioFocus(
+        audioFocusChangeListener,
+        AudioManager.STREAM_MUSIC,
+        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+      )
+    }
+  }
+
+  private fun deactivateDuckingSession() {
+    if (!isDucking) return
+    audioFocusChangeListener ?: return
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      audioFocusRequest?.let { request ->
+        audioManager.abandonAudioFocusRequest(request)
+      }
+    } else {
+      @Suppress("DEPRECATION")
+      audioManager.abandonAudioFocus(audioFocusChangeListener)
+    }
+    audioFocusChangeListener = null
+    audioFocusRequest = null
   }
 
   private fun processPendingOperations() {
@@ -143,6 +196,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
             synchronized(queueLock) {
               speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
                 item.status = SpeechStatus.COMPLETED
+                deactivateDuckingSession()
                 emitOnFinish(getEventData(utteranceId))
                 if (!isPaused) {
                   currentQueueIndex++
@@ -155,6 +209,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
             synchronized(queueLock) {
               speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
                 item.status = SpeechStatus.ERROR
+                deactivateDuckingSession()
                 emitOnError(getEventData(utteranceId))
                 if (!isPaused) {
                   currentQueueIndex++
@@ -265,6 +320,9 @@ class SpeechModule(reactContext: ReactApplicationContext) :
   private fun getValidatedOptions(options: ReadableMap): Map<String, Any> {
     val validated = globalOptions.toMutableMap()
 
+    if (options.hasKey("ducking")) {
+      validated["ducking"] = options.getBoolean("ducking")
+    }
     if (options.hasKey("voice")) {
       options.getString("voice")?.let { validated["voice"] = it }
     }
@@ -368,6 +426,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
     ensureInitialized(promise) {
       if (synthesizer.isSpeaking || isPaused) {
         synthesizer.stop()
+        deactivateDuckingSession()
         synchronized(queueLock) {
           if (currentQueueIndex in speechQueue.indices) {
             val item = speechQueue[currentQueueIndex]
@@ -387,6 +446,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
       } else {
         isPaused = true
         synthesizer.stop()
+        deactivateDuckingSession()
         promise.resolve(true)
       }
     }
@@ -403,6 +463,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
         if (pausedItemIndex >= 0) {
           currentQueueIndex = pausedItemIndex
           isPaused = false
+          activateDuckingSession()
           processNextQueueItem()
           promise.resolve(true)
         } else {
@@ -419,6 +480,8 @@ class SpeechModule(reactContext: ReactApplicationContext) :
       return
     }
     ensureInitialized(promise) {
+      isDucking = globalOptions["ducking"] as? Boolean ?: false
+      activateDuckingSession()
       val utteranceId = getUniqueID()
       val queueItem = SpeechQueueItem(text = text, options = emptyMap(), utteranceId = utteranceId)
       synchronized(queueLock) {
@@ -438,8 +501,10 @@ class SpeechModule(reactContext: ReactApplicationContext) :
       return
     }
     ensureInitialized(promise) {
+      val validatedOptions = getValidatedOptions(options) 
+      isDucking = validatedOptions["ducking"] as? Boolean ?: false
+      activateDuckingSession()
       val utteranceId = getUniqueID()
-      val validatedOptions = getValidatedOptions(options)
       val queueItem = SpeechQueueItem(text = text, options = validatedOptions, utteranceId = utteranceId)
       synchronized(queueLock) {
         speechQueue.add(queueItem)
