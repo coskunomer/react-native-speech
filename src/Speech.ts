@@ -51,6 +51,15 @@ export default class Speech {
     return TurboSpeech.setEngine(engineName);
   }
   /**
+   * Opens the system UI to install or update TTS voice data.
+   * @returns Promise<void> Resolves when the installer activity has been launched.
+   * @throws If the installer activity cannot be opened on the device.
+   * @platform android
+   */
+  public static openVoiceDataInstaller(): Promise<void> {
+    return TurboSpeech.openVoiceDataInstaller();
+  }
+  /**
    * Sets the global options for all subsequent speak() calls
    * @param options - Voice configuration options
    * @example

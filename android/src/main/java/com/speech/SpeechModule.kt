@@ -4,6 +4,7 @@ import java.util.UUID
 import java.util.Locale
 import android.os.Build
 import android.os.Bundle
+import android.content.Intent
 import android.content.Context
 import android.speech.tts.Voice
 import android.media.AudioManager
@@ -551,6 +552,25 @@ class SpeechModule(reactContext: ReactApplicationContext) :
 
     pendingOperations.add(Pair({ promise.resolve(null) }, promise))
     initializeTTS()
+  }
+
+   override fun openVoiceDataInstaller(promise: Promise) {
+    try {
+      val activity = currentActivity
+      if (activity == null) {
+        promise.reject("ACTIVITY_UNAVAILABLE", "The current activity is not available to launch the installer.")
+        return
+      }
+      val installIntent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
+      if (installIntent.resolveActivity(activity.packageManager) != null) {
+        activity.startActivity(installIntent)
+        promise.resolve(null)
+      } else {
+        promise.reject("UNSUPPORTED_OPERATION", "No activity found to handle TTS voice data installation on this device.")
+      }
+    } catch (e: Exception) {
+      promise.reject("INSTALLER_ERROR", "An unexpected error occurred while trying to open the TTS voice installer.", e)
+    }
   }
 
   override fun invalidate() {
