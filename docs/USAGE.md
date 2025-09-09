@@ -6,6 +6,10 @@
     - [Expo](#expo)
   - [API Overview](#api-overview)
     - [Getting Available Voices](#getting-available-voices)
+    - [Engine Management (Android)](#engine-management-android)
+      - [Get Available Engines](#get-available-engines)
+      - [Set Speech Engine](#set-speech-engine)
+      - [Open Voice Data Installer](#open-voice-data-installer)
     - [Initializing Global Speech Options](#initializing-global-speech-options)
     - [Resetting Speech Options](#resetting-speech-options)
     - [Speaking Text](#speaking-text)
@@ -113,6 +117,81 @@ Speech.getAvailableVoices('en-US').then(voices => {
 
 ---
 
+### Engine Management (Android)
+
+These methods are available only on the Android platform and allow you to manage the underlying text-to-speech engine.
+
+#### Get Available Engines
+
+Gets a list of all available text-to-speech engines installed on the device.
+
+**API Definition**
+
+```ts
+Speech.getEngines(): Promise<EngineProps[]>
+```
+
+**Engine Properties:**
+
+- `name`: The unique system identifier for the engine (e.g., "com.google.android.tts").
+- `label`: The human-readable display name (e.g., "Google Text-to-Speech Engine").
+- `isDefault`: A boolean flag indicating if this is the default engine.
+
+**Example Usage:**
+
+```ts
+Speech.getEngines().then(engines => {
+  engines.forEach(engine => {
+    console.log(`Engine: ${engine.label} (${engine.name})`);
+    if (engine.isDefault) {
+      console.log('This is the default engine.');
+    }
+  });
+});
+```
+
+#### Set Speech Engine
+
+Sets the text-to-speech engine to use for all subsequent synthesis.
+
+**API Definition**
+
+```ts
+Speech.setEngine(engineName: string): Promise<void>
+```
+
+**Example Usage:**
+
+```ts
+// First, get available engines
+const engines = await Speech.getEngines();
+
+if (engines.length > 0) {
+  // Then set a specific engine by its name
+  await Speech.setEngine(engines[0].name);
+}
+```
+
+#### Open Voice Data Installer
+
+Opens the system activity that allows the user to install or manage TTS voice data.
+
+**API Definition**
+
+```ts
+Speech.openVoiceDataInstaller(): Promise<void>
+```
+
+**Example Usage:**
+
+```ts
+Speech.openVoiceDataInstaller().catch(error => {
+  console.error('Failed to open voice data installer.', error);
+});
+```
+
+---
+
 ### Initializing Global Speech Options
 
 Set global speech options that apply to all speech synthesis calls.
@@ -125,11 +204,21 @@ Speech.initialize(options: VoiceOptions): void
 
 **VoiceOptions Properties:**
 
-- `language`: Language code or IETF BCP 47 language tag (e.g., `'en-US'`, `'fr-FR'`).
-- `volume`: Volume level (from `0.0` to `1.0`).
-- `voice`: Specific voice identifier to use.
-- `pitch`: Pitch multiplier (Android: `0.1`–`2.0`; iOS: `0.5`–`2.0`).
-- `rate`: Speech rate (Android: `0.1`–`2.0`; iOS: varies based on `AVSpeechUtterance` limits).
+| Property     | Type                              | Description                                                                                     | Platform Support |
+| ------------ | --------------------------------- | ----------------------------------------------------------------------------------------------- | ---------------- |
+| `language`   | `string`                          | Language code or IETF BCP 47 language tag (e.g., `'en-US'`, `'fr-FR'`)                          | Both             |
+| `volume`     | `number`                          | Volume level from `0.0` (silent) to `1.0` (maximum)                                             | Both             |
+| `voice`      | `string`                          | Specific voice identifier to use (obtained from `getAvailableVoices()`)                         | Both             |
+| `pitch`      | `number`                          | Pitch multiplier: Android `0.1`–`2.0`, iOS `0.5`–`2.0`                                          | Both             |
+| `rate`       | `number`                          | Speech rate: Android `0.1`–`2.0`, iOS varies based on `AVSpeechUtterance` limits                | Both             |
+| `ducking`    | `boolean`                         | If `true`, temporarily lowers audio from other apps while speech is active. Defaults to `false` | Both             |
+| `silentMode` | `'obey' \| 'respect' \| 'ignore'` | Controls how speech interacts with the device's silent switch. Ignored if `ducking` is `true`   | iOS only         |
+
+**silentMode Options (iOS only):**
+
+- **`obey`** (default): Does not change the app's audio session. Speech follows the system default behavior.
+- **`respect`**: Speech will be silenced by the ringer switch. Use for non-critical audio content.
+- **`ignore`**: Speech will play even if the ringer is off. Use for critical audio when ducking is not desired.
 
 **Example Usage:**
 
@@ -139,6 +228,8 @@ Speech.initialize({
   volume: 1.0,
   pitch: 1.2,
   rate: 0.8,
+  ducking: false,
+  silentMode: 'obey', // iOS only; ignored if ducking is true
 });
 ```
 
@@ -336,7 +427,7 @@ stoppedSubscription.remove();
 
 **Callback Parameters:**
 
-- `id`: The uttenrance identifier
+- `id`: The utterance identifier
 - `length`: The text being spoken length
 - `location`: The current position in the spoken text
 

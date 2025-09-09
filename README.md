@@ -11,7 +11,7 @@ A high-performance text-to-speech library built for bare React Native and Expo, 
 </div>
 <br/>
 
-> **Only New Architecture**: This library is currently compatible with the new architecture. If you're using React Native 0.76 or higher, it is already enabled. However, if your React Native version is between 0.68 and 0.75, you need to enable it first. [Click here if you need help enabling the new architecture](https://github.com/reactwg/react-native-new-architecture/blob/main/docs/enable-apps.md)
+> **Only New Architecture**: This library is only compatible with the new architecture. If you're using React Native 0.76 or higher, it is already enabled. However, if your React Native version is between 0.68 and 0.75, you need to enable it first. [Click here if you need help enabling the new architecture](https://github.com/reactwg/react-native-new-architecture/blob/main/docs/enable-apps.md)
 
 ## Preview
 
@@ -21,17 +21,19 @@ A high-performance text-to-speech library built for bare React Native and Expo, 
 
 ## Features
 
-- 🚀 &nbsp;High-performance library built with Turbo Modules for Android and iOS
+- 🚀 &nbsp;**High Performance** - Built on Turbo Modules for a fast, native-like experience on Android & iOS
 
-- 🎛️ &nbsp;Provides essential methods for full control over synthesis
+- 🎛️ &nbsp;**Full Control** - Complete set of methods for comprehensive speech synthesis management
 
-- 🪄 &nbsp;Support for the `pause` and `resume` methods—including the `onPause` and `onResume` events—on Android as well. Unlike iOS, which natively provides these features, this library implements its own handling on Android (API 26+ required)
+- 🪄 &nbsp;**Consistent Playback** - Offers `pause` and `resume` support for iOS and Android. Since this functionality isn’t natively available on Android, the library provides a custom implementation (API 26+) designed to emulate the iOS experience
 
-- 📡 &nbsp;Offers useful events for more precise control over synthesis
+- 🔊 &nbsp;**Optional Audio Ducking** - Automatically lowers other app audio to ensure clear, uninterrupted speech
 
-- 💅 &nbsp;Includes a customizable [HighlightedText](./docs/USAGE.md#highlightedtext) component to display the currently spoken text
+- 📡 &nbsp;**Rich Events** - Comprehensive event system for precise synthesis lifecycle monitoring
 
-- ✅ &nbsp;Fully type-safe and written in TypeScript
+- 💅 &nbsp;**Visual Feedback** - Customizable [HighlightedText](./docs/USAGE.md#highlightedtext) component for real-time speech visualization
+
+- ✅ &nbsp;**Type Safety** - Fully written in TypeScript with complete type definitions
 
 ## Installation
 
