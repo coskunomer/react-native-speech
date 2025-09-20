@@ -1,14 +1,14 @@
-#import "Speech.h"
+#import "RNMSpeech.h"
 
 using namespace JS::NativeSpeech;
 
-@implementation Speech
+@implementation RNMSpeech
 {
   BOOL isDucking;
   NSDictionary *defaultOptions;
 }
 
-RCT_EXPORT_MODULE();
+RCT_EXPORT_MODULE(Speech);
 
 + (BOOL)requiresMainQueueSetup {
   return NO;
