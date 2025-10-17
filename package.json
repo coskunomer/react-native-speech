@@ -157,7 +157,10 @@
   "codegenConfig": {
     "name": "RNSpeechSpec",
     "type": "modules",
-    "jsSrcsDir": "src"
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.mhpdev.speech"
+    }
   },
   "create-react-native-library": {
     "languages": "kotlin-objc",

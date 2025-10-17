@@ -114,4 +114,4 @@ export interface Spec extends TurboModule {
   readonly onProgress: EventEmitter<ProgressEventProps>;
 }
 
-export default TurboModuleRegistry.getEnforcing<Spec>('Speech');
+export default TurboModuleRegistry.getEnforcing<Spec>('RNSpeech');

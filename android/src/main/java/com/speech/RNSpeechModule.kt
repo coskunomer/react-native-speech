@@ -1,4 +1,4 @@
-package com.speech
+package com.mhpdev.speech
 
 import java.util.UUID
 import java.util.Locale
@@ -21,8 +21,8 @@ import android.speech.tts.UtteranceProgressListener
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.module.annotations.ReactModule
 
-@ReactModule(name = SpeechModule.NAME)
-class SpeechModule(reactContext: ReactApplicationContext) :
+@ReactModule(name = RNSpeechModule.NAME)
+class RNSpeechModule(reactContext: ReactApplicationContext) :
   NativeSpeechSpec(reactContext) {
 
   override fun getName(): String {
@@ -36,7 +36,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
   }
 
   companion object {
-    const val NAME = "Speech"
+    const val NAME = "RNSpeech"
 
     private val defaultOptions: Map<String, Any> = mapOf(
       "rate" to 0.5f,

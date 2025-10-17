@@ -1,8 +1,8 @@
-#import "Speech.h"
+#import "RNSpeech.h"
 
 using namespace JS::NativeSpeech;
 
-@implementation Speech
+@implementation RNSpeech
 {
   BOOL isDucking;
   NSDictionary *defaultOptions;

@@ -1,4 +1,4 @@
-package com.speech
+package com.mhpdev.speech
 
 import com.facebook.react.BaseReactPackage
 import com.facebook.react.bridge.NativeModule
@@ -7,10 +7,10 @@ import com.facebook.react.module.model.ReactModuleInfo
 import com.facebook.react.module.model.ReactModuleInfoProvider
 import java.util.HashMap
 
-class SpeechPackage : BaseReactPackage() {
+class RNSpeechPackage : BaseReactPackage() {
   override fun getModule(name: String, reactContext: ReactApplicationContext): NativeModule? {
-    return if (name == SpeechModule.NAME) {
-      SpeechModule(reactContext)
+    return if (name == RNSpeechModule.NAME) {
+      RNSpeechModule(reactContext)
     } else {
       null
     }
@@ -19,9 +19,9 @@ class SpeechPackage : BaseReactPackage() {
   override fun getReactModuleInfoProvider(): ReactModuleInfoProvider {
     return ReactModuleInfoProvider {
       val moduleInfos: MutableMap<String, ReactModuleInfo> = HashMap()
-      moduleInfos[SpeechModule.NAME] = ReactModuleInfo(
-        SpeechModule.NAME,
-        SpeechModule.NAME,
+      moduleInfos[RNSpeechModule.NAME] = ReactModuleInfo(
+        RNSpeechModule.NAME,
+        RNSpeechModule.NAME,
         false,  // canOverrideExistingModule
         false,  // needsEagerInit
         false,  // isCxxModule
