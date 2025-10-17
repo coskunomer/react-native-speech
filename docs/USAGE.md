@@ -5,6 +5,7 @@
     - [Bare React Native](#bare-react-native)
     - [Expo](#expo)
   - [API Overview](#api-overview)
+    - [Constants](#constants)
     - [Getting Available Voices](#getting-available-voices)
     - [Engine Management (Android)](#engine-management-android)
       - [Get Available Engines](#get-available-engines)
@@ -78,6 +79,18 @@ import Speech from '@mhpdev/react-native-speech';
 ```
 
 ---
+
+### Constants
+
+The `Speech` class static constants.
+
+**Values**
+
+`maxInputLength`
+
+The **maximum number of characters** allowed in a single call to the speak methods.
+
+Android enforces this limit, which is determined by `TextToSpeech.getMaxSpeechInputLength`. If your text exceeds this limit, you must manually split it into smaller utterances on the JavaScript side. (_iOS has no synthesis system limit, and by default, the speech class returns `Number.MAX_VALUE`_)
 
 ### Getting Available Voices
 

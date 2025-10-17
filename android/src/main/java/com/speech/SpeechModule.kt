@@ -29,6 +29,12 @@ class SpeechModule(reactContext: ReactApplicationContext) :
     return NAME
   }
 
+  override fun getTypedExportedConstants(): MutableMap<String, Any> {
+    return mutableMapOf(
+      "maxInputLength" to maxInputLength
+    )
+  }
+
   companion object {
     const val NAME = "Speech"
 
@@ -41,7 +47,7 @@ class SpeechModule(reactContext: ReactApplicationContext) :
     )
   }
   private val queueLock = Any()
-
+  private val maxInputLength = TextToSpeech.getMaxSpeechInputLength()
   private val isSupportedPausing = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
 
   private lateinit var synthesizer: TextToSpeech
@@ -480,6 +486,13 @@ class SpeechModule(reactContext: ReactApplicationContext) :
       promise.reject("speech_error", "Text cannot be null")
       return
     }
+    if (text.length > maxInputLength) {
+      promise.reject(
+        "speech_error",
+        "Text exceeds the maximum input length of $maxInputLength characters"
+      )
+      return
+    }
     ensureInitialized(promise) {
       isDucking = globalOptions["ducking"] as? Boolean ?: false
       activateDuckingSession()
@@ -501,8 +514,15 @@ class SpeechModule(reactContext: ReactApplicationContext) :
       promise.reject("speech_error", "Text cannot be null")
       return
     }
+    if (text.length > maxInputLength) {
+      promise.reject(
+        "speech_error",
+        "Text exceeds the maximum input length of $maxInputLength characters"
+      )
+      return
+    }
     ensureInitialized(promise) {
-      val validatedOptions = getValidatedOptions(options) 
+      val validatedOptions = getValidatedOptions(options)
       isDucking = validatedOptions["ducking"] as? Boolean ?: false
       activateDuckingSession()
       val utteranceId = getUniqueID()

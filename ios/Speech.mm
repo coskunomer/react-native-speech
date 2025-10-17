@@ -14,6 +14,16 @@ RCT_EXPORT_MODULE();
   return NO;
 }
 
+- (NSDictionary<NSString *, id> *)constantsToExport
+{
+  return @{};
+}
+
+- (NSDictionary<NSString *, id> *)getConstants
+{
+  return [self constantsToExport];
+}
+
 - (instancetype)init {
   self = [super init];
 

@@ -39,7 +39,7 @@ export interface VoiceOptions {
   /**
    * Determines how speech audio interacts with the device's silent (ringer) switch.
    * This option is ignored if `ducking` is `true`.
-   * @platform ios
+   * @platform iOS
    *
    * - `obey`: (Default) Does not change the app's audio session. Speech follows the system default.
    * - `respect`: Speech will be silenced by the ringer switch. Use for non-critical audio.
@@ -80,7 +80,18 @@ export interface EngineProps {
    */
   isDefault: boolean;
 }
+
+interface ConstantsProps {
+  /**
+   * The maximum number of characters allowed in a single call to `speak()` or `speakWithOptions()`.
+   * @platform Android
+   */
+  maxInputLength?: number;
+}
+
 export interface Spec extends TurboModule {
+  getConstants: () => ConstantsProps;
+  //Methods
   reset: () => void;
   stop: () => Promise<void>;
   pause: () => Promise<boolean>;
@@ -93,7 +104,7 @@ export interface Spec extends TurboModule {
   setEngine: (engineName: string) => Promise<void>;
   getAvailableVoices: (language: string) => Promise<VoiceProps[]>;
   speakWithOptions: (text: string, options: VoiceOptions) => Promise<void>;
-
+  //Listeners
   readonly onError: EventEmitter<EventProps>;
   readonly onStart: EventEmitter<EventProps>;
   readonly onFinish: EventEmitter<EventProps>;

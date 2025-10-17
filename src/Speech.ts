@@ -3,6 +3,16 @@ import type {VoiceProps, VoiceOptions, EngineProps} from './NativeSpeech';
 
 export default class Speech {
   /**
+   * The *maximum number of characters allowed in a single call to the speak methods.
+   *
+   * On `Android`, this value is determined by `TextToSpeech.getMaxSpeechInputLength`.
+   * Text exceeding this length must be manually split into smaller utterances on the JavaScript side.
+   *
+   * On `iOS`, there is no synthesis system limit, and by default, the speech class returns `Number.MAX_VALUE`.
+   */
+  static readonly maxInputLength =
+    TurboSpeech.getConstants().maxInputLength ?? Number.MAX_VALUE;
+  /**
    * Gets a list of all available voices on the device
    * @param language - Optional language code to filter voices (e.g., 'en', 'fr', 'en-US', 'fr-FR').
    *                  If not provided, returns all available voices.
@@ -21,7 +31,7 @@ export default class Speech {
   /**
    * Gets a list of all available text-to-speech engines on the device
    * @returns Promise<EngineProps[]> Array of engine properties including name, label, and isDefault flag
-   * @platform android
+   * @platform Android
    * @example
    * const engines = await Speech.getEngines();
    * engines.forEach(engine => {
@@ -38,7 +48,7 @@ export default class Speech {
    * Sets the text-to-speech engine to use for speech synthesis
    * @param engineName - The name of the engine to use (obtained from getEngines())
    * @returns Promise<void> Resolves when engine is set
-   * @platform android
+   * @platform Android
    * @example
    * // First, get available engines
    * const engines = await Speech.getEngines();
@@ -54,7 +64,7 @@ export default class Speech {
    * Opens the system UI to install or update TTS voice data.
    * @returns Promise<void> Resolves when the installer activity has been launched.
    * @throws If the installer activity cannot be opened on the device.
-   * @platform android
+   * @platform Android
    */
   public static openVoiceDataInstaller(): Promise<void> {
     return TurboSpeech.openVoiceDataInstaller();
