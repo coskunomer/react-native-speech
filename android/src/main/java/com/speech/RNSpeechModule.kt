@@ -16,7 +16,6 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.bridge.ReadableMap
-import com.facebook.fbreact.specs.NativeSpeechSpec
 import android.speech.tts.UtteranceProgressListener
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.module.annotations.ReactModule
