@@ -26,7 +26,7 @@ export default class Speech {
    * const englishVoices = await Speech.getAvailableVoices('en');
    */
   public static getAvailableVoices(language?: string): Promise<VoiceProps[]> {
-    return TurboSpeech.getAvailableVoices(language ?? '');
+    return TurboSpeech.getAvailableVoices(language);
   }
   /**
    * Gets a list of all available text-to-speech engines on the device
