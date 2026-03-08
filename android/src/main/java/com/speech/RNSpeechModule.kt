@@ -61,6 +61,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   private var isInitialized = false
   private var isInitializing = false
+  private var listenerSet = false
   private val pendingOperations = mutableListOf<Pair<() -> Unit, Promise>>()
 
   private var globalOptions: MutableMap<String, Any> = defaultOptions.toMutableMap()
@@ -179,116 +180,125 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     }
   }
 
-  // NEW: Verify that TTS is actually ready with voices loaded
   private fun verifyTTSReady(retryCount: Int = 0) {
-    val maxRetries = 10
-    
+    val maxRetries = 20
+    val delay = when {
+        retryCount == 0 -> 500L
+        retryCount < 5  -> 1000L
+        else            -> 2000L
+    }
+
     mainHandler.postDelayed({
-      try {
-        val voices = synthesizer.voices
-        val engines = synthesizer.engines
-        
-        if (voices != null && voices.isNotEmpty() && engines != null && engines.isNotEmpty()) {
-          // Success - TTS is ready
-          Log.d(TAG, "TTS verified ready with ${voices.size} voices and ${engines.size} engines")
-          cachedEngines = engines
-          
-          synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String) {
-              synchronized(queueLock) {
-                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
-                  item.status = SpeechStatus.SPEAKING
-                  if (isResuming && item.position > 0) {
-                    emitOnResume(getEventData(utteranceId))
-                    isResuming = false
-                  } else {
-                    emitOnStart(getEventData(utteranceId))
-                  }
+        try {
+            val voices = synthesizer.voices
+            val engines = synthesizer.engines
+
+            if (!voices.isNullOrEmpty() && !engines.isNullOrEmpty()) {
+                Log.d(TAG, "TTS verified ready with ${voices.size} voices and ${engines.size} engines")
+                cachedEngines = engines
+
+                if (!listenerSet) {
+                    synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(utteranceId: String) {
+                            synchronized(queueLock) {
+                                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                                    item.status = SpeechStatus.SPEAKING
+                                    if (isResuming && item.position > 0) {
+                                        emitOnResume(getEventData(utteranceId))
+                                        isResuming = false
+                                    } else {
+                                        emitOnStart(getEventData(utteranceId))
+                                    }
+                                }
+                            }
+                        }
+
+                        override fun onDone(utteranceId: String) {
+                            synchronized(queueLock) {
+                                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                                    item.status = SpeechStatus.COMPLETED
+                                    deactivateDuckingSession()
+                                    emitOnFinish(getEventData(utteranceId))
+                                    if (!isPaused) {
+                                        currentQueueIndex++
+                                        processNextQueueItem()
+                                    }
+                                }
+                            }
+                        }
+
+                        override fun onError(utteranceId: String) {
+                            synchronized(queueLock) {
+                                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                                    item.status = SpeechStatus.ERROR
+                                    deactivateDuckingSession()
+                                    emitOnError(getEventData(utteranceId))
+                                    if (!isPaused) {
+                                        currentQueueIndex++
+                                        processNextQueueItem()
+                                    }
+                                }
+                            }
+                        }
+
+                        override fun onStop(utteranceId: String, interrupted: Boolean) {
+                            synchronized(queueLock) {
+                                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                                    if (isPaused) {
+                                        item.status = SpeechStatus.PAUSED
+                                        emitOnPause(getEventData(utteranceId))
+                                    } else {
+                                        item.status = SpeechStatus.COMPLETED
+                                        emitOnStopped(getEventData(utteranceId))
+                                    }
+                                }
+                            }
+                        }
+
+                        override fun onRangeStart(utteranceId: String, start: Int, end: Int, frame: Int) {
+                            synchronized(queueLock) {
+                                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                                    item.position = item.offset + start
+                                    val data = Arguments.createMap().apply {
+                                        putInt("id", utteranceId.hashCode())
+                                        putInt("length", end - start)
+                                        putInt("location", item.position)
+                                    }
+                                    emitOnProgress(data)
+                                }
+                            }
+                        }
+                    })
+                    listenerSet = true
                 }
-              }
+
+                applyGlobalOptions()
+                isInitialized = true
+                isInitializing = false
+                processPendingOperations()
+
+            } else if (retryCount < maxRetries) {
+                Log.w(TAG, "TTS not ready yet (retry ${retryCount + 1}/$maxRetries), voices=${voices?.size ?: 0}, engines=${engines?.size ?: 0}")
+                verifyTTSReady(retryCount + 1)
+            } else {
+                Log.e(TAG, "TTS failed to become ready after $maxRetries retries")
+                isInitialized = false
+                isInitializing = false
+                rejectPendingOperations()
             }
-            override fun onDone(utteranceId: String) {
-              synchronized(queueLock) {
-                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
-                  item.status = SpeechStatus.COMPLETED
-                  deactivateDuckingSession()
-                  emitOnFinish(getEventData(utteranceId))
-                  if (!isPaused) {
-                    currentQueueIndex++
-                    processNextQueueItem()
-                  }
-                }
-              }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception during TTS verification (retry $retryCount)", e)
+            if (retryCount < maxRetries) {
+                verifyTTSReady(retryCount + 1)
+            } else {
+                isInitialized = false
+                isInitializing = false
+                rejectPendingOperations()
             }
-            override fun onError(utteranceId: String) {
-              synchronized(queueLock) {
-                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
-                  item.status = SpeechStatus.ERROR
-                  deactivateDuckingSession()
-                  emitOnError(getEventData(utteranceId))
-                  if (!isPaused) {
-                    currentQueueIndex++
-                    processNextQueueItem()
-                  }
-                }
-              }
-            }
-            override fun onStop(utteranceId: String, interrupted: Boolean) {
-              synchronized(queueLock) {
-                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
-                  if (isPaused) {
-                    item.status = SpeechStatus.PAUSED
-                    emitOnPause(getEventData(utteranceId))
-                  } else {
-                    item.status = SpeechStatus.COMPLETED
-                    emitOnStopped(getEventData(utteranceId))
-                  }
-                }
-              }
-            }
-            override fun onRangeStart(utteranceId: String, start: Int, end: Int, frame: Int) {
-              synchronized(queueLock) {
-                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
-                  item.position = item.offset + start
-                  val data = Arguments.createMap().apply {
-                    putInt("id", utteranceId.hashCode())
-                    putInt("length", end - start)
-                    putInt("location", item.position)
-                  }
-                  emitOnProgress(data)
-                }
-              }
-            }
-          })
-          
-          applyGlobalOptions()
-          isInitialized = true
-          isInitializing = false
-          processPendingOperations()
-          
-        } else if (retryCount < maxRetries) {
-          // Retry - voices not ready yet
-          Log.w(TAG, "TTS not ready yet (retry ${retryCount + 1}/$maxRetries), voices=${voices?.size ?: 0}, engines=${engines?.size ?: 0}")
-          verifyTTSReady(retryCount + 1)
-        } else {
-          // Failed after all retries
-          Log.e(TAG, "TTS initialization failed after $maxRetries retries")
-          isInitialized = false
-          isInitializing = false
-          rejectPendingOperations()
         }
-      } catch (e: Exception) {
-        Log.e(TAG, "Error verifying TTS", e)
-        if (retryCount < maxRetries) {
-          verifyTTSReady(retryCount + 1)
-        } else {
-          isInitialized = false
-          isInitializing = false
-          rejectPendingOperations()
-        }
-      }
-    }, if (retryCount == 0) 500L else 1000L) // Initial delay 500ms, then 1s between retries
-  }
+    }, delay)
+}
 
   private fun initializeTTS() {
     if (isInitializing) return
@@ -322,8 +332,12 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       }
       else -> {
         pendingOperations.add(Pair(operation, promise))
+        // Shut down any zombie instance before reinitializing
+        if (::synthesizer.isInitialized) {
+            try { synthesizer.stop(); synthesizer.shutdown() } catch (_: Exception) {}
+        }
         initializeTTS()
-      }
+}
     }
   }
 
@@ -333,10 +347,10 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       synthesizer.setLanguage(locale)
     }
     globalOptions["pitch"]?.let {
-      synthesizer.setPitch(it as Float)
+      synthesizer.setPitch((it as? Number)?.toFloat() ?: 1.0f)
     }
     globalOptions["rate"]?.let {
-      synthesizer.setSpeechRate(it as Float)
+      synthesizer.setSpeechRate((it as? Number)?.toFloat() ?: 0.5f)
     }
     globalOptions["voice"]?.let { voiceId ->
       synthesizer.voices?.forEach { voice ->
@@ -357,10 +371,10 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       synthesizer.setLanguage(locale)
     }
     tempOptions["pitch"]?.let {
-      synthesizer.setPitch(it as Float)
+    synthesizer.setPitch((it as? Number)?.toFloat() ?: 1.0f)
     }
     tempOptions["rate"]?.let {
-      synthesizer.setSpeechRate(it as Float)
+        synthesizer.setSpeechRate((it as? Number)?.toFloat() ?: 0.5f)
     }
     tempOptions["voice"]?.let { voiceId ->
       synthesizer.voices?.forEach { voice ->
@@ -577,11 +591,11 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       val queueItem = SpeechQueueItem(text = text, options = validatedOptions, utteranceId = utteranceId)
       synchronized(queueLock) {
         speechQueue.add(queueItem)
-        if (!synthesizer.isSpeaking && !isPaused) {
-          currentQueueIndex = speechQueue.size - 1
-          processNextQueueItem()
+        if (!synthesizer.isSpeaking && !isPaused && currentQueueIndex == -1) {
+            currentQueueIndex = 0  // always start from beginning if nothing is running
+            processNextQueueItem()
         }
-      }
+    }
       promise.resolve(null)
     }
   }
@@ -630,8 +644,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     isInitializing = false
     resetQueueState()
 
-    pendingOperations.add(Pair({ promise.resolve(null) }, promise))
     initializeTTS()
+    promise.resolve(null)
   }
 
    override fun openVoiceDataInstaller(promise: Promise) {
