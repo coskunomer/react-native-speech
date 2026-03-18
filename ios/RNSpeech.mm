@@ -195,6 +195,10 @@ RCT_EXPORT_MODULE();
   resolve(voicesArray);
 }
 
+- (void)getActiveEngine:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+  resolve(@"");
+}
+
 - (void)openVoiceDataInstaller:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
   resolve(nil);
 }

@@ -5,6 +5,7 @@ const mockFn = (...args) => {
 const mockPromise = (...args) => Promise.resolve(undefined);
 const mockPromiseBool = (...args) => Promise.resolve(false);
 const mockPromiseArr = (...args) => Promise.resolve([]);
+const mockPromiseStr = (...args) => Promise.resolve('');
 
 const {fn: jestFn} = require('jest-mock');
 const eventSub = {remove: jestFn()};
@@ -24,6 +25,7 @@ class Speech {
   static getEngines = mockPromiseArr;
   static setEngine = mockPromise;
   static openVoiceDataInstaller = mockPromise;
+  static getActiveEngine = mockPromiseStr;
   static onError = eventMock;
   static onStart = eventMock;
   static onFinish = eventMock;

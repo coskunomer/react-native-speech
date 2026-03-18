@@ -32,8 +32,16 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   override fun getTypedExportedConstants(): MutableMap<String, Any> {
     return mutableMapOf(
-      "maxInputLength" to maxInputLength
+      "maxInputLength" to maxInputLength,
+      "googleTtsPackage" to "com.google.android.tts"
     )
+  }
+
+  override fun getActiveEngine(promise: Promise) {
+    ensureInitialized(promise) {
+      val active = selectedEngine ?: synthesizer.defaultEngine ?: ""
+      promise.resolve(active)
+    }
   }
 
   companion object {

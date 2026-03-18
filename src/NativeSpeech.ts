@@ -104,6 +104,7 @@ export interface Spec extends TurboModule {
   setEngine: (engineName: string) => Promise<void>;
   getAvailableVoices: (language?: string) => Promise<VoiceProps[]>;
   speakWithOptions: (text: string, options: VoiceOptions) => Promise<void>;
+  getActiveEngine(): Promise<string>;
   //Listeners
   readonly onError: EventEmitter<EventProps>;
   readonly onStart: EventEmitter<EventProps>;
