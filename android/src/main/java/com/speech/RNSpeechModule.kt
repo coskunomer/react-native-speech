@@ -32,8 +32,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   override fun getTypedExportedConstants(): MutableMap<String, Any> {
     return mutableMapOf(
-      "maxInputLength" to maxInputLength,
-      "googleTtsPackage" to "com.google.android.tts"
+      "maxInputLength" to maxInputLength
     )
   }
 
