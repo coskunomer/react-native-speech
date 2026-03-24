@@ -158,6 +158,11 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     return params
   }
 
+  private fun pruneCompletedItems() {
+    speechQueue.removeAll { it.status == SpeechStatus.COMPLETED || it.status == SpeechStatus.ERROR }
+    currentQueueIndex = -1
+  }
+
   private fun getEventData(utteranceId: String): ReadableMap {
     return Arguments.createMap().apply {
       putInt("id", utteranceId.hashCode())
@@ -568,12 +573,14 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       val utteranceId = getUniqueID()
       val queueItem = SpeechQueueItem(text = text, options = emptyMap(), utteranceId = utteranceId)
       synchronized(queueLock) {
-        speechQueue.add(queueItem)
-        if (!synthesizer.isSpeaking && !isPaused) {
-          currentQueueIndex = speechQueue.size - 1
-          processNextQueueItem()
-        }
+          if (!synthesizer.isSpeaking && !isPaused) pruneCompletedItems()
+          speechQueue.add(queueItem)
+          if (!synthesizer.isSpeaking && !isPaused) {
+              currentQueueIndex = speechQueue.size - 1
+              processNextQueueItem()
+          }
       }
+
       promise.resolve(null)
     }
   }
@@ -597,12 +604,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       val utteranceId = getUniqueID()
       val queueItem = SpeechQueueItem(text = text, options = validatedOptions, utteranceId = utteranceId)
       synchronized(queueLock) {
-        speechQueue.add(queueItem)
-        if (!synthesizer.isSpeaking && !isPaused && currentQueueIndex == -1) {
-            currentQueueIndex = 0  // always start from beginning if nothing is running
-            processNextQueueItem()
-        }
-    }
+          if (!synthesizer.isSpeaking && !isPaused) pruneCompletedItems()
+          speechQueue.add(queueItem)
+          if (!synthesizer.isSpeaking && !isPaused) {
+              currentQueueIndex = speechQueue.size - 1
+              processNextQueueItem()
+          }
+      }
       promise.resolve(null)
     }
   }
