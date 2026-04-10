@@ -211,6 +211,11 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         try {
             val voices = synthesizer.voices
             val engines = synthesizer.engines
+            Log.d(TAG, "=== TTS VERIFY (retry $retryCount) ===")
+            Log.d(TAG, "voices count: ${voices?.size ?: "null"}")
+            Log.d(TAG, "engines count: ${engines?.size ?: "null"}")
+            engines?.forEach { Log.d(TAG, "  engine: ${it.name} / ${it.label}") }
+            voices?.take(3)?.forEach { Log.d(TAG, "  voice: ${it.name} (${it.locale})") }
 
             if (!voices.isNullOrEmpty() && !engines.isNullOrEmpty()) {
                 Log.d(TAG, "TTS verified ready with ${voices.size} voices and ${engines.size} engines")
