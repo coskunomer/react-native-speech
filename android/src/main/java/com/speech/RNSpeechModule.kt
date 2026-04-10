@@ -632,26 +632,17 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   override fun getEngines(promise: Promise) {
     ensureInitialized(promise) {
-        // synthesizer.engines only returns engines known to the current TTS
-        // instance. Query the package manager directly to get ALL installed
-        // TTS engines regardless of their ready state.
         val pm = reactApplicationContext.packageManager
-        val pmEngines = pm.queryIntentServices(
+        val installedEngines = pm.queryIntentServices(
             Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), 0
         )
-        Log.d(TAG, "PackageManager sees ${pmEngines.size} engines:")
-        pmEngines.forEach { Log.d(TAG, "  pm engine: ${it.serviceInfo.packageName}") }
 
-        Log.d(TAG, "=== TTS VERIFY (retry $retryCount) ===")
-        Log.d(TAG, "voices count: ${voices?.size ?: "null"}")
-        Log.d(TAG, "engines count: ${engines?.size ?: "null"}")
-        engines?.forEach { Log.d(TAG, "  engine: ${it.name} / ${it.label}") }
-        val intent = Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE)
-        val installedEngines = pm.queryIntentServices(intent, 0)
+        Log.d(TAG, "PackageManager sees ${installedEngines.size} engines:")
+        installedEngines.forEach { Log.d(TAG, "  pm engine: ${it.serviceInfo.packageName}") }
 
         val defaultEngine = synthesizer.defaultEngine
-
         val enginesArray = Arguments.createArray()
+
         installedEngines.forEach { resolveInfo ->
             val packageName = resolveInfo.serviceInfo.packageName
             val label = resolveInfo.loadLabel(pm).toString()
