@@ -635,7 +635,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         // synthesizer.engines only returns engines known to the current TTS
         // instance. Query the package manager directly to get ALL installed
         // TTS engines regardless of their ready state.
-         val pm = reactApplicationContext.packageManager
+        val pm = reactApplicationContext.packageManager
         val pmEngines = pm.queryIntentServices(
             Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), 0
         )
