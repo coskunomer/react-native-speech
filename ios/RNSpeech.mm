@@ -104,11 +104,24 @@ RCT_EXPORT_MODULE();
 }
 
 - (NSDictionary *)getVoiceItem:(AVSpeechSynthesisVoice *)voice {
+  NSString *quality;
+  switch (voice.quality) {
+    case AVSpeechSynthesisVoiceQualityPremium:
+      quality = @"VeryHigh";
+      break;
+    case AVSpeechSynthesisVoiceQualityEnhanced:
+      quality = @"High";
+      break;
+    case AVSpeechSynthesisVoiceQualityDefault:
+    default:
+      quality = @"Normal";
+      break;
+  }
   return @{
     @"name": voice.name,
     @"language": voice.language,
     @"identifier": voice.identifier,
-    @"quality": voice.quality == AVSpeechSynthesisVoiceQualityEnhanced ? @"Enhanced" : @"Default"
+    @"quality": quality
   };
 }
 

@@ -170,12 +170,19 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   }
 
   private fun getVoiceItem(voice: Voice): ReadableMap {
-    val quality = if (voice.quality > Voice.QUALITY_NORMAL) "Enhanced" else "Default"
+    val quality = when (voice.quality) {
+        Voice.QUALITY_VERY_HIGH -> "VeryHigh"
+        Voice.QUALITY_HIGH      -> "High"
+        Voice.QUALITY_NORMAL    -> "Normal"
+        Voice.QUALITY_LOW       -> "Low"
+        Voice.QUALITY_VERY_LOW  -> "VeryLow"
+        else                    -> "Normal"
+    }
     return Arguments.createMap().apply {
-      putString("quality", quality)
-      putString("name", voice.name)
-      putString("identifier", voice.name)
-      putString("language", voice.locale.toLanguageTag())
+        putString("quality", quality)
+        putString("name", voice.name)
+        putString("identifier", voice.name)
+        putString("language", voice.locale.toLanguageTag())
     }
   }
 
@@ -316,18 +323,21 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     if (isInitializing) return
     isInitializing = true
 
-    synthesizer = TextToSpeech(reactApplicationContext, { status ->
-      if (status == TextToSpeech.SUCCESS) {
-        // Don't set isInitialized yet - wait for verification
-        Log.d(TAG, "TTS engine callback SUCCESS, verifying voices...")
-        verifyTTSReady()
-      } else {
-        Log.e(TAG, "TTS engine initialization failed with status: $status")
-        isInitialized = false
-        isInitializing = false
-        rejectPendingOperations()
-      }
-    }, selectedEngine)
+    val initListener = TextToSpeech.OnInitListener { status ->
+        if (status == TextToSpeech.SUCCESS) {
+            Log.d(TAG, "TTS engine callback SUCCESS, verifying voices...")
+            verifyTTSReady()
+        } else {
+            Log.e(TAG, "TTS engine initialization failed with status: $status")
+            isInitialized = false
+            isInitializing = false
+            rejectPendingOperations()
+        }
+    }
+
+    synthesizer = selectedEngine?.let { engine ->
+        TextToSpeech(reactApplicationContext, initListener, engine)
+    } ?: TextToSpeech(reactApplicationContext, initListener)
   }
 
   private fun ensureInitialized(promise: Promise, operation: () -> Unit) {
