@@ -627,43 +627,68 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   override fun getEngines(promise: Promise) {
     ensureInitialized(promise) {
-      val enginesArray = Arguments.createArray()
-      cachedEngines?.forEach { engine ->
-        enginesArray.pushMap(
-          Arguments.createMap().apply {
-            putString("name", engine.name)
-            putString("label", engine.label)
-            putBoolean("isDefault", engine.name == synthesizer.defaultEngine)
-          }
-        )
-      }
-      promise.resolve(enginesArray)
+        // synthesizer.engines only returns engines known to the current TTS
+        // instance. Query the package manager directly to get ALL installed
+        // TTS engines regardless of their ready state.
+        val pm = reactApplicationContext.packageManager
+        val intent = Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE)
+        val installedEngines = pm.queryIntentServices(intent, 0)
+
+        val defaultEngine = synthesizer.defaultEngine
+
+        val enginesArray = Arguments.createArray()
+        installedEngines.forEach { resolveInfo ->
+            val packageName = resolveInfo.serviceInfo.packageName
+            val label = resolveInfo.loadLabel(pm).toString()
+            enginesArray.pushMap(
+                Arguments.createMap().apply {
+                    putString("name", packageName)
+                    putString("label", label)
+                    putBoolean("isDefault", packageName == defaultEngine)
+                }
+            )
+        }
+
+        // Keep cachedEngines in sync for setEngine validation
+        cachedEngines = installedEngines.map { resolveInfo ->
+            TextToSpeech.EngineInfo().apply {
+                name = resolveInfo.serviceInfo.packageName
+                label = resolveInfo.loadLabel(pm).toString()
+            }
+        }
+
+        promise.resolve(enginesArray)
     }
-  }
+}
 
   override fun setEngine(engineName: String, promise: Promise) {
-    if (cachedEngines?.any { it.name == engineName } == false) {
-      promise.reject("engine_error", "Engine '$engineName' is not available")
-      return
-    }
-    if (isInitialized) {
-      val activeEngine = selectedEngine ?: synthesizer.defaultEngine
-      if (activeEngine == engineName) {
-        promise.resolve(null)
+    val pm = reactApplicationContext.packageManager
+    val intent = Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE)
+    val isInstalled = pm.queryIntentServices(intent, 0)
+        .any { it.serviceInfo.packageName == engineName }
+
+    if (!isInstalled) {
+        promise.reject("engine_error", "Engine '$engineName' is not available")
         return
-      }
     }
-    
-    // Shutdown existing TTS before switching engines
+
+    if (isInitialized) {
+        val activeEngine = selectedEngine ?: synthesizer.defaultEngine
+        if (activeEngine == engineName) {
+            promise.resolve(null)
+            return
+        }
+    }
+
     if (::synthesizer.isInitialized) {
-      try {
-        synthesizer.stop()
-        synthesizer.shutdown()
-      } catch (e: Exception) {
-        Log.w(TAG, "Error shutting down TTS before engine switch", e)
-      }
+        try {
+            synthesizer.stop()
+            synthesizer.shutdown()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error shutting down TTS before engine switch", e)
+        }
     }
-    
+
     selectedEngine = engineName
     isInitialized = false
     isInitializing = false
@@ -671,7 +696,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
     initializeTTS()
     promise.resolve(null)
-  }
+}
 
    override fun openVoiceDataInstaller(promise: Promise) {
     try {
