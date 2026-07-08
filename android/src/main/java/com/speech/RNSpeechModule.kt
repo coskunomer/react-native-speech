@@ -517,7 +517,6 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
     val generationAtCallTime = initGeneration
 
     Log.d(TAG, "engine=${synthesizer.defaultEngine}")
-    Log.d(TAG, "engine=${synthesizer.activeEngine}")
     Log.d(TAG, "voice=${synthesizer.voice?.name}")
     Log.d(TAG, "language=${synthesizer.language}")
     Log.d(TAG, "isSpeaking=${synthesizer.isSpeaking}")
