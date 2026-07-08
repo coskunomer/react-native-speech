@@ -422,8 +422,26 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     val item = itemToSpeak ?: return
     val generationAtCallTime = initGeneration
 
+    Log.d(TAG, "engine=${synthesizer.defaultEngine}")
+    Log.d(TAG, "voice=${synthesizer.voice?.name}")
+    Log.d(TAG, "language=${synthesizer.language}")
+    Log.d(TAG, "isSpeaking=${synthesizer.isSpeaking}")
+
     // Call into the engine OUTSIDE queueLock.
-    synthesizer.speak(textToSpeak, queueModeToUse, paramsToUse, item.utteranceId)
+    val result = synthesizer.speak(
+      textToSpeak,
+      queueModeToUse,
+      paramsToUse,
+      item.utteranceId
+    )
+
+    Log.d(TAG, "speak() returned $result")
+
+    if (result == TextToSpeech.ERROR) {
+        Log.e(TAG, "Huawei immediately rejected speak()")
+        teardownAndReinitialize()
+        return
+    }
     armSpeakWatchdog(item.utteranceId, generationAtCallTime)
   }
 
