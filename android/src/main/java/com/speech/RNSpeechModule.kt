@@ -55,6 +55,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     // entirely instead of silently retrying forever.
     private const val MAX_TOTAL_FAILURES = 4
 
+    private const val PROBE_UTTERANCE_PREFIX = "connectivity-probe-"
+
     private val defaultOptions: Map<String, Any> = mapOf(
       "rate" to 0.5f,
       "pitch" to 1.0f,
@@ -118,6 +120,10 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   // Bumped on every engine (re)construction. Any callback / watchdog that
   // captured an older generation number is stale and must be ignored.
   private var initGeneration = 0
+
+  // Utterance id of an in-flight init-time connectivity probe, or null if
+  // none outstanding. Only one is ever in flight at a time.
+  private var pendingProbeUtteranceId: String? = null
 
   // ────────────────────────────────────────────────────────────────────────
   // Init
@@ -198,53 +204,148 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
    * Retries up to 20 times with escalating back-off (500 ms → 1 s → 2 s).
    */
   private fun verifyTTSReady(retryCount: Int = 0, generation: Int) {
-    val maxRetries = 20
-    val delay = when {
-      retryCount == 0 -> 500L
-      retryCount < 5 -> 1000L
-      else -> 2000L
-    }
-
-    mainHandler.postDelayed({
-      if (generation != initGeneration) return@postDelayed // superseded by a newer init
-      try {
-        val voices = synthesizer.voices
-        val engines = synthesizer.engines
-        if (!voices.isNullOrEmpty() && !engines.isNullOrEmpty()) {
-          Log.d(TAG, "TTS ready: ${voices.size} voices, ${engines.size} engines")
-          cachedEngines = engines
-          attachUtteranceListener()
-          applyGlobalOptions(setLanguage = true)
-          isInitialized = true
-          isInitializing = false
-          processPendingOperations()
-          // FIX: resume the queue after an engine-failure rebuild instead of
-          // requiring a fresh speak() call from JS to notice anything is
-          // playable again.
-          if (pendingQueueResume) {
-            pendingQueueResume = false
-            processNextQueueItem()
-          }
-        } else if (retryCount < maxRetries) {
-          Log.w(TAG, "TTS not ready (retry ${retryCount + 1}/$maxRetries)")
-          verifyTTSReady(retryCount + 1, generation)
-        } else {
-          Log.e(TAG, "TTS failed to become ready after $maxRetries retries")
-          isInitialized = false
-          isInitializing = false
-          rejectPendingOperations()
-        }
-      } catch (e: Exception) {
-        Log.e(TAG, "Exception during TTS verification (retry $retryCount)", e)
-        if (retryCount < maxRetries) verifyTTSReady(retryCount + 1, generation)
-        else {
-          isInitialized = false
-          isInitializing = false
-          rejectPendingOperations()
-        }
-      }
-    }, delay)
+  val maxRetries = 20
+  val delay = when {
+    retryCount == 0 -> 500L
+    retryCount < 5 -> 1000L
+    else -> 2000L
   }
+
+  mainHandler.postDelayed({
+    if (generation != initGeneration) return@postDelayed
+    try {
+      val voices = synthesizer.voices
+      val engines = synthesizer.engines
+      if (!voices.isNullOrEmpty() && !engines.isNullOrEmpty()) {
+        Log.d(TAG, "Voices/engines available (${voices.size}/${engines.size}), probing connectivity…")
+        cachedEngines = engines
+        attachUtteranceListener()
+        applyGlobalOptions(setLanguage = true)
+        // FIX: non-empty voices/engines is NOT proof the engine is usable —
+        // it can be served from cached PackageManager metadata before the
+        // binder connection to the service is actually live. Do NOT mark
+        // isInitialized here. Only a real onStart on a probe utterance
+        // (see probeEngineConnectivity) proves the pipe works, and only
+        // completeInitialization() — called from that onStart — is allowed
+        // to flip isInitialized.
+        probeEngineConnectivity(generation)
+      } else if (retryCount < maxRetries) {
+        Log.w(TAG, "TTS not ready (retry ${retryCount + 1}/$maxRetries)")
+        verifyTTSReady(retryCount + 1, generation)
+      } else {
+        Log.e(TAG, "TTS failed to become ready after $maxRetries retries")
+        isInitialized = false
+        isInitializing = false
+        rejectPendingOperations()
+      }
+    } catch (e: Exception) {
+      Log.e(TAG, "Exception during TTS verification (retry $retryCount)", e)
+      if (retryCount < maxRetries) verifyTTSReady(retryCount + 1, generation)
+      else {
+        isInitialized = false
+        isInitializing = false
+        rejectPendingOperations()
+      }
+    }
+  }, delay)
+}
+
+/**
+ * FIX (root cause): fires an inaudible canary utterance right after
+ * voices/engines look populated, and only trusts the engine once that
+ * canary's onStart actually fires. If the engine is half-connected, this
+ * fails exactly the way a real utterance would — synchronous ERROR
+ * (Google's failure mode) or no onStart within WATCHDOG_TIMEOUT_MS
+ * (Huawei's failure mode) — and gets run through the same
+ * retry/fallback/give-up policy, automatically, before speak() is ever
+ * called from JS. Previously that policy only ever triggered off of a
+ * real, user-audible failed utterance.
+ */
+private fun probeEngineConnectivity(generation: Int) {
+  val id = PROBE_UTTERANCE_PREFIX + uniqueId()
+  pendingProbeUtteranceId = id
+
+  val result = try {
+    synthesizer.playSilentUtterance(1L, TextToSpeech.QUEUE_FLUSH, id)
+  } catch (e: Exception) {
+    Log.e(TAG, "Connectivity probe threw", e)
+    TextToSpeech.ERROR
+  }
+
+  if (result == TextToSpeech.ERROR) {
+    Log.e(TAG, "Connectivity probe rejected synchronously")
+    pendingProbeUtteranceId = null
+    handleInitProbeFailure("speak_rejected", generation)
+    return
+  }
+
+  mainHandler.postDelayed({
+    if (generation != initGeneration) return@postDelayed // superseded, ignore
+    if (pendingProbeUtteranceId == id) {
+      Log.e(
+        TAG,
+        "Connectivity probe watchdog: no onStart within ${WATCHDOG_TIMEOUT_MS}ms — " +
+          "engine is half-connected, forcing rebuild"
+      )
+      pendingProbeUtteranceId = null
+      handleInitProbeFailure("watchdog_timeout", generation)
+    }
+  }, WATCHDOG_TIMEOUT_MS)
+}
+
+  private fun completeInitialization(generation: Int) {
+    if (generation != initGeneration) return
+    Log.d(TAG, "Connectivity probe succeeded — engine is live")
+    // FIX: re-apply globalOptions here too, not just pre-probe in
+    // verifyTTSReady — picks up any initialize() calls that arrived during
+    // the probe window and were deliberately skipped above because
+    // `synthesizer` wasn't confirmed live yet.
+    try {
+      applyGlobalOptions(setLanguage = true)
+    } catch (e: Exception) {
+      Log.w(TAG, "completeInitialization(): failed to (re)apply options", e)
+    }
+    isInitialized = true
+    isInitializing = false
+    engineFailureCounts.remove(selectedEngine ?: synthesizer.defaultEngine ?: "unknown")
+    totalConsecutiveFailures = 0
+    processPendingOperations()
+    if (pendingQueueResume) {
+      pendingQueueResume = false
+      processNextQueueItem()
+    }
+  }
+
+/** Same policy as handleEngineFailure(), but for the init-time probe — no
+ * SpeechQueueItem exists yet, just engine-health bookkeeping. */
+private fun handleInitProbeFailure(reason: String, generation: Int) {
+  if (generation != initGeneration) return
+
+  val engineName = selectedEngine ?: (if (::synthesizer.isInitialized) synthesizer.defaultEngine else null) ?: "unknown"
+  val engineFailures = (engineFailureCounts[engineName] ?: 0) + 1
+  engineFailureCounts[engineName] = engineFailures
+  totalConsecutiveFailures++
+
+  Log.e(TAG, "Init probe on '$engineName' failed ($reason). consecutiveForEngine=$engineFailures totalConsecutive=$totalConsecutiveFailures")
+
+  if (totalConsecutiveFailures >= MAX_TOTAL_FAILURES) {
+    emitOnError(errorEventData(uniqueId(), reason = "engine_dead", engine = engineName))
+    engineDead = true
+    isInitializing = false
+    rejectPendingOperations()
+    resetQueueState()
+    return
+  }
+
+  if (engineFailures < MAX_ENGINE_FAILURES) {
+    teardownAndReinitialize(preserveQueue = true)
+  } else {
+    emitOnError(errorEventData(uniqueId(), reason = "engine_unavailable", engine = engineName))
+    engineFailureCounts.remove(engineName)
+    selectedEngine = null
+    teardownAndReinitialize(preserveQueue = true)
+  }
+}
 
   // ────────────────────────────────────────────────────────────────────────
   // Utterance listener
@@ -256,10 +357,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   // ────────────────────────────────────────────────────────────────────────
   private fun attachUtteranceListener() {
     synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+      
       override fun onStart(utteranceId: String) {
-        // FIX: a successful onStart is proof the current engine is actually
-        // working end-to-end. Clear failure tracking so a one-off transient
-        // failure doesn't count against a since-recovered engine.
+        if (utteranceId == pendingProbeUtteranceId) {
+          pendingProbeUtteranceId = null
+          completeInitialization(initGeneration)
+          return
+        }
         val engineName = selectedEngine ?: synthesizer.defaultEngine
         if (engineName != null) engineFailureCounts.remove(engineName)
         totalConsecutiveFailures = 0
@@ -292,6 +396,11 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
       }
 
       override fun onError(utteranceId: String) {
+        if (utteranceId == pendingProbeUtteranceId) {
+          pendingProbeUtteranceId = null
+          handleInitProbeFailure("speak_rejected", initGeneration)
+          return
+        }
         synchronized(queueLock) {
           speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
             item.status = SpeechStatus.ERROR
@@ -733,8 +842,23 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     val newOptions = globalOptions.toMutableMap()
     newOptions.putAll(getValidatedOptions(options))
     globalOptions = newOptions
-    // Only pass setLanguage=true if the language actually changed
-    applyGlobalOptions(setLanguage = true)
+
+    // FIX: previously called applyGlobalOptions(setLanguage = true)
+    // unconditionally. JS calls this fire-and-forget, and with the
+    // connectivity probe now extending rebuild latency, it's easy for this
+    // to land inside teardownAndReinitialize()'s window where `synthesizer`
+    // still points to an already-shutdown instance — silently broken, same
+    // failure mode reset() was already guarded against. globalOptions is
+    // updated above regardless, and completeInitialization() re-applies it
+    // once the probe actually confirms the engine is live, so a call landing
+    // mid-rebuild isn't lost — we just don't touch a dead object here.
+    if (isInitialized && ::synthesizer.isInitialized) {
+      try {
+        applyGlobalOptions(setLanguage = true)
+      } catch (e: Exception) {
+        Log.w(TAG, "initialize(): engine not actually ready, options will apply once init completes", e)
+      }
+    }
   }
 
   override fun reset() {
