@@ -36,7 +36,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
 
     // How long we wait for onStart() to fire after calling speak() before
     // we treat the engine connection as stuck and force a rebuild.
-    private const val WATCHDOG_TIMEOUT_MS = 4000L
+    private const val WATCHDOG_TIMEOUT_MS = 5000L
 
     // Small delay inserted between shutdown() of the old engine and
     // construction of the new TextToSpeech instance, to reduce the odds of
@@ -135,42 +135,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   private fun initializeTTS() {
     if (isInitializing) return
     isInitializing = true
-    val myGen = ++initGeneration
 
-    synthesizer = TextToSpeech(reactApplicationContext, { status ->
-      if (myGen != initGeneration) return@TextToSpeech // stale callback, ignore
-      if (status == TextToSpeech.SUCCESS) {
-        Log.d(TAG, "TTS engine callback SUCCESS, verifying voices…")
-        verifyTTSReady(generation = myGen)
-      } else {
-        Log.e(TAG, "TTS engine init failed with status: $status")
-        isInitialized = false
-        isInitializing = false
-        rejectPendingOperations()
-      }
-    }, selectedEngine)
-  }
-
-  /**
-   * Tears down the current engine (if any) and schedules a fresh
-   * initializeTTS() after a short delay.
-   *
-   * The delay exists because immediately constructing a new TextToSpeech
-   * right after shutdown() on the old one can hit an Android race: the new
-   * instance's connection to the underlying ITextToSpeechService can be left
-   * in limbo even though onInit(SUCCESS) fires and .voices / .engines return
-   * real (PackageManager-backed, not binder-backed) data. Waiting a beat
-   * before reconstructing reduces the odds of landing in that half-connected
-   * state.
-   *
-   * @param preserveQueue FIX: when true (engine-failure recovery), the
-   *   pending speech queue is kept intact and resumed automatically once the
-   *   new engine reports ready. Previously this method ALWAYS wiped the
-   *   queue via resetQueueState(), which meant any auto-recovery attempt
-   *   silently threw away the utterance that was being spoken — the text
-   *   was gone forever even when the rebuild succeeded.
-   */
-  private fun teardownAndReinitialize(preserveQueue: Boolean = false) {
     if (::synthesizer.isInitialized) {
       try {
         synthesizer.stop()
@@ -179,7 +144,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
         Log.w(TAG, "Error shutting down TTS engine", e)
       }
     }
-    initGeneration++ // invalidate any in-flight callbacks/watchdogs tied to the old engine
+    initGeneration++ 
     isInitialized = false
     isInitializing = false
     listenerSet = false
@@ -192,63 +157,31 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
       resetQueueState()
     }
 
+    synthesizer = TextToSpeech(reactApplicationContext, { status ->
+      if (status == TextToSpeech.SUCCESS) {
+        Log.d(TAG, "TTS engine callback SUCCESS")
+        onEngineConstructed(myGen)
+      } else {
+        Log.e(TAG, "TTS engine init failed with status: $status")
+        isInitialized = false
+        isInitializing = false
+        rejectPendingOperations()
+      }
+    }, selectedEngine)
+  }
+
+  private fun onEngineConstructed(generation: Int) {
+    cachedEngines = synthesizer.engines
+    attachUtteranceListener()
+    applyGlobalOptions(setLanguage = true)
+    probeEngineConnectivity(generation)
+  }
+
+  private fun teardownAndReinitialize(preserveQueue: Boolean = false) {
     mainHandler.postDelayed({
       initializeTTS()
     }, ENGINE_REINIT_DELAY_MS)
   }
-
-  /**
-   * Polls until the engine has voices and engines available, then attaches
-   * the utterance listener and marks the module ready.
-   *
-   * Retries up to 20 times with escalating back-off (500 ms → 1 s → 2 s).
-   */
-  private fun verifyTTSReady(retryCount: Int = 0, generation: Int) {
-  val maxRetries = 20
-  val delay = when {
-    retryCount == 0 -> 500L
-    retryCount < 5 -> 1000L
-    else -> 2000L
-  }
-
-  mainHandler.postDelayed({
-    if (generation != initGeneration) return@postDelayed
-    try {
-      val voices = synthesizer.voices
-      val engines = synthesizer.engines
-      if (!voices.isNullOrEmpty() && !engines.isNullOrEmpty()) {
-        Log.d(TAG, "Voices/engines available (${voices.size}/${engines.size}), probing connectivity…")
-        cachedEngines = engines
-        attachUtteranceListener()
-        applyGlobalOptions(setLanguage = true)
-        // FIX: non-empty voices/engines is NOT proof the engine is usable —
-        // it can be served from cached PackageManager metadata before the
-        // binder connection to the service is actually live. Do NOT mark
-        // isInitialized here. Only a real onStart on a probe utterance
-        // (see probeEngineConnectivity) proves the pipe works, and only
-        // completeInitialization() — called from that onStart — is allowed
-        // to flip isInitialized.
-        probeEngineConnectivity(generation)
-      } else if (retryCount < maxRetries) {
-        Log.w(TAG, "TTS not ready (retry ${retryCount + 1}/$maxRetries)")
-        verifyTTSReady(retryCount + 1, generation)
-      } else {
-        Log.e(TAG, "TTS failed to become ready after $maxRetries retries")
-        isInitialized = false
-        isInitializing = false
-        rejectPendingOperations()
-      }
-    } catch (e: Exception) {
-      Log.e(TAG, "Exception during TTS verification (retry $retryCount)", e)
-      if (retryCount < maxRetries) verifyTTSReady(retryCount + 1, generation)
-      else {
-        isInitialized = false
-        isInitializing = false
-        rejectPendingOperations()
-      }
-    }
-  }, delay)
-}
 
 /**
  * FIX (root cause): fires an inaudible canary utterance right after
@@ -296,10 +229,6 @@ private fun probeEngineConnectivity(generation: Int) {
   private fun completeInitialization(generation: Int) {
     if (generation != initGeneration) return
     Log.d(TAG, "Connectivity probe succeeded — engine is live")
-    // FIX: re-apply globalOptions here too, not just pre-probe in
-    // verifyTTSReady — picks up any initialize() calls that arrived during
-    // the probe window and were deliberately skipped above because
-    // `synthesizer` wasn't confirmed live yet.
     try {
       applyGlobalOptions(setLanguage = true)
     } catch (e: Exception) {
@@ -587,6 +516,7 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
     val generationAtCallTime = initGeneration
 
     Log.d(TAG, "engine=${synthesizer.defaultEngine}")
+    Log.d(TAG, "engine=${synthesizer.activeEngine}")
     Log.d(TAG, "voice=${synthesizer.voice?.name}")
     Log.d(TAG, "language=${synthesizer.language}")
     Log.d(TAG, "isSpeaking=${synthesizer.isSpeaking}")
@@ -872,7 +802,6 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
     // instance at that moment is silently broken and was a real
     // contributor to "the engine just doesn't come back" symptoms.
     // Guard: only touch the live synthesizer if it's actually ready. If
-    // it's not, verifyTTSReady() will apply these (now-updated)
     // globalOptions itself once the new instance comes up.
     if (isInitialized && ::synthesizer.isInitialized) {
       try {
