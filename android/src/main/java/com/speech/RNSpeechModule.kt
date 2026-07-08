@@ -372,21 +372,22 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   // ────────────────────────────────────────────────────────────────────────
 
   private fun ensureInitialized(promise: Promise, operation: () -> Unit) {
-    when {
-      isInitialized -> {
-        try { operation() }
-        catch (e: Exception) { promise.reject("speech_error", e.message ?: "Unknown error") }
+  when {
+    isInitialized -> {
+      try { operation() }
+      catch (e: Exception) { promise.reject("speech_error", e.message ?: "Unknown error") }
+    }
+    isInitializing -> pendingOperations.add(Pair(operation, promise))
+    else -> {
+      pendingOperations.add(Pair(operation, promise))
+      if (::synthesizer.isInitialized) {
+        try { synthesizer.stop(); synthesizer.shutdown() } catch (_: Exception) {}
       }
-      isInitializing -> pendingOperations.add(Pair(operation, promise))
-      else -> {
-        pendingOperations.add(Pair(operation, promise))
-        if (::synthesizer.isInitialized) {
-          try { synthesizer.stop(); synthesizer.shutdown() } catch (_: Exception) {}
-        }
-        initializeTTS()
-      }
+      resetQueueState()
+      initializeTTS()
     }
   }
+}
 
   private fun processPendingOperations() {
     val ops = ArrayList(pendingOperations)
