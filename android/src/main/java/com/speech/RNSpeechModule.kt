@@ -83,6 +83,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   private var audioFocusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
   private var audioFocusRequest: AudioFocusRequest? = null
   private var isDucking = false
+  private var initGeneration = 0
 
   // ────────────────────────────────────────────────────────────────────────
   // Init
@@ -95,8 +96,10 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   private fun initializeTTS() {
     if (isInitializing) return
     isInitializing = true
+    val myGen = ++initGeneration
 
     synthesizer = TextToSpeech(reactApplicationContext, { status ->
+      if (myGen != initGeneration) return@TextToSpeech  // stale callback, ignore
       if (status == TextToSpeech.SUCCESS) {
         Log.d(TAG, "TTS engine callback SUCCESS, verifying voices…")
         verifyTTSReady()
@@ -124,6 +127,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     }
 
     mainHandler.postDelayed({
+      if (gen != initGeneration) return@postDelayed // superseded by a newer init
       try {
         val voices  = synthesizer.voices
         val engines = synthesizer.engines
@@ -372,22 +376,27 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   // ────────────────────────────────────────────────────────────────────────
 
   private fun ensureInitialized(promise: Promise, operation: () -> Unit) {
-  when {
-    isInitialized -> {
-      try { operation() }
-      catch (e: Exception) { promise.reject("speech_error", e.message ?: "Unknown error") }
-    }
-    isInitializing -> pendingOperations.add(Pair(operation, promise))
-    else -> {
-      pendingOperations.add(Pair(operation, promise))
-      if (::synthesizer.isInitialized) {
-        try { synthesizer.stop(); synthesizer.shutdown() } catch (_: Exception) {}
+    when {
+      isInitialized -> {
+        try { operation() }
+        catch (e: Exception) { promise.reject("speech_error", e.message ?: "Unknown error") }
       }
-      resetQueueState()
-      initializeTTS()
+      isInitializing -> pendingOperations.add(Pair(operation, promise))
+      else -> {
+        pendingOperations.add(Pair(operation, promise))
+        if (::synthesizer.isInitialized) {
+          try { synthesizer.stop(); synthesizer.shutdown() } catch (_: Exception) {}
+        }
+        initGeneration++          // invalidate any in-flight init immediately
+        selectedEngine = engineName
+        isInitialized  = false
+        isInitializing = false
+        listenerSet    = false
+        resetQueueState()
+        initializeTTS()
+      }
     }
   }
-}
 
   private fun processPendingOperations() {
     val ops = ArrayList(pendingOperations)
