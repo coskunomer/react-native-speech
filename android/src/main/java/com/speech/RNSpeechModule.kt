@@ -23,8 +23,7 @@ import com.facebook.react.module.annotations.ReactModule
 import android.util.Log
 
 @ReactModule(name = RNSpeechModule.NAME)
-class RNSpeechModule(reactContext: ReactApplicationContext) :
-  NativeSpeechSpec(reactContext) {
+class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(reactContext) {
 
   override fun getName(): String = NAME
 
@@ -35,60 +34,67 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     const val NAME = "RNSpeech"
     private const val TAG = "RNSpeech"
 
+    // How long we wait for onStart() to fire after calling speak() before
+    // we treat the engine connection as stuck and force a rebuild.
+    private const val WATCHDOG_TIMEOUT_MS = 4000L
+
+    // Small delay inserted between shutdown() of the old engine and
+    // construction of the new TextToSpeech instance, to reduce the odds of
+    // hitting the Android race where the new engine reports SUCCESS /
+    // returns cached voices & engines before its binder connection is
+    // actually wired up.
+    private const val ENGINE_REINIT_DELAY_MS = 300L
+
     private val defaultOptions: Map<String, Any> = mapOf(
-      "rate"     to 0.5f,
-      "pitch"    to 1.0f,
-      "volume"   to 1.0f,
-      "ducking"  to false,
+      "rate" to 0.5f,
+      "pitch" to 1.0f,
+      "volume" to 1.0f,
+      "ducking" to false,
       "language" to Locale.getDefault().toLanguageTag()
     )
   }
 
   // ── Constants ────────────────────────────────────────────────────────────
-
-  private val maxInputLength       = TextToSpeech.getMaxSpeechInputLength()
-  private val isSupportedPausing   = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-  private val mainHandler          = Handler(Looper.getMainLooper())
+  private val maxInputLength = TextToSpeech.getMaxSpeechInputLength()
+  private val isSupportedPausing = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+  private val mainHandler = Handler(Looper.getMainLooper())
 
   // ── TTS engine ───────────────────────────────────────────────────────────
-
   private lateinit var synthesizer: TextToSpeech
   private var selectedEngine: String? = null
   private var cachedEngines: List<TextToSpeech.EngineInfo>? = null
 
   // ── Init state ───────────────────────────────────────────────────────────
-
-  private var isInitialized  = false
+  private var isInitialized = false
   private var isInitializing = false
-  private var listenerSet    = false
+  private var listenerSet = false
   private val pendingOperations = mutableListOf<Pair<() -> Unit, Promise>>()
 
   // ── Options ──────────────────────────────────────────────────────────────
-
   private var globalOptions: MutableMap<String, Any> = defaultOptions.toMutableMap()
 
   // ── Queue state ──────────────────────────────────────────────────────────
-
-  private val queueLock        = Any()
-  private val speechQueue      = mutableListOf<SpeechQueueItem>()
+  private val queueLock = Any()
+  private val speechQueue = mutableListOf<SpeechQueueItem>()
   private var currentQueueIndex = -1
-  private var isPaused         = false
-  private var isResuming       = false
+  private var isPaused = false
+  private var isResuming = false
 
   // ── Audio focus ──────────────────────────────────────────────────────────
-
   private val audioManager: AudioManager by lazy {
     reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
   }
   private var audioFocusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
   private var audioFocusRequest: AudioFocusRequest? = null
   private var isDucking = false
+
+  // Bumped on every engine (re)construction. Any callback / watchdog that
+  // captured an older generation number is stale and must be ignored.
   private var initGeneration = 0
 
   // ────────────────────────────────────────────────────────────────────────
   // Init
   // ────────────────────────────────────────────────────────────────────────
-
   init {
     initializeTTS()
   }
@@ -99,17 +105,49 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     val myGen = ++initGeneration
 
     synthesizer = TextToSpeech(reactApplicationContext, { status ->
-      if (myGen != initGeneration) return@TextToSpeech  // stale callback, ignore
-        if (status == TextToSpeech.SUCCESS) {
-          Log.d(TAG, "TTS engine callback SUCCESS, verifying voices…")
-          verifyTTSReady(generation = myGen)
+      if (myGen != initGeneration) return@TextToSpeech // stale callback, ignore
+      if (status == TextToSpeech.SUCCESS) {
+        Log.d(TAG, "TTS engine callback SUCCESS, verifying voices…")
+        verifyTTSReady(generation = myGen)
       } else {
         Log.e(TAG, "TTS engine init failed with status: $status")
-        isInitialized  = false
+        isInitialized = false
         isInitializing = false
         rejectPendingOperations()
       }
     }, selectedEngine)
+  }
+
+  /**
+   * Tears down the current engine (if any) and schedules a fresh
+   * initializeTTS() after a short delay.
+   *
+   * The delay exists because immediately constructing a new TextToSpeech
+   * right after shutdown() on the old one can hit an Android race: the new
+   * instance's connection to the underlying ITextToSpeechService can be left
+   * in limbo even though onInit(SUCCESS) fires and .voices / .engines return
+   * real (PackageManager-backed, not binder-backed) data. Waiting a beat
+   * before reconstructing reduces the odds of landing in that half-connected
+   * state.
+   */
+  private fun teardownAndReinitialize() {
+    if (::synthesizer.isInitialized) {
+      try {
+        synthesizer.stop()
+        synthesizer.shutdown()
+      } catch (e: Exception) {
+        Log.w(TAG, "Error shutting down TTS engine", e)
+      }
+    }
+    initGeneration++ // invalidate any in-flight callbacks/watchdogs tied to the old engine
+    isInitialized = false
+    isInitializing = false
+    listenerSet = false
+    resetQueueState()
+
+    mainHandler.postDelayed({
+      initializeTTS()
+    }, ENGINE_REINIT_DELAY_MS)
   }
 
   /**
@@ -122,31 +160,29 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     val maxRetries = 20
     val delay = when {
       retryCount == 0 -> 500L
-      retryCount < 5  -> 1000L
-      else            -> 2000L
+      retryCount < 5 -> 1000L
+      else -> 2000L
     }
 
     mainHandler.postDelayed({
       if (generation != initGeneration) return@postDelayed // superseded by a newer init
       try {
-        val voices  = synthesizer.voices
+        val voices = synthesizer.voices
         val engines = synthesizer.engines
-
         if (!voices.isNullOrEmpty() && !engines.isNullOrEmpty()) {
           Log.d(TAG, "TTS ready: ${voices.size} voices, ${engines.size} engines")
           cachedEngines = engines
           attachUtteranceListener()
           applyGlobalOptions(setLanguage = true)
-          isInitialized  = true
+          isInitialized = true
           isInitializing = false
           processPendingOperations()
-
         } else if (retryCount < maxRetries) {
           Log.w(TAG, "TTS not ready (retry ${retryCount + 1}/$maxRetries)")
           verifyTTSReady(retryCount + 1, generation)
         } else {
           Log.e(TAG, "TTS failed to become ready after $maxRetries retries")
-          isInitialized  = false
+          isInitialized = false
           isInitializing = false
           rejectPendingOperations()
         }
@@ -154,7 +190,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         Log.e(TAG, "Exception during TTS verification (retry $retryCount)", e)
         if (retryCount < maxRetries) verifyTTSReady(retryCount + 1, generation)
         else {
-          isInitialized  = false
+          isInitialized = false
           isInitializing = false
           rejectPendingOperations()
         }
@@ -170,10 +206,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   // engines, engine switches, resets). Never call setLanguage() without
   // immediately calling attachUtteranceListener() afterwards.
   // ────────────────────────────────────────────────────────────────────────
-
   private fun attachUtteranceListener() {
     synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-
       override fun onStart(utteranceId: String) {
         synchronized(queueLock) {
           speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
@@ -235,8 +269,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
           speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
             item.position = item.offset + start
             val data = Arguments.createMap().apply {
-              putInt("id",       utteranceId.hashCode())
-              putInt("length",   end - start)
+              putInt("id", utteranceId.hashCode())
+              putInt("length", end - start)
               putInt("location", item.position)
             }
             emitOnProgress(data)
@@ -250,11 +284,10 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   // ────────────────────────────────────────────────────────────────────────
   // Options helpers
   // ────────────────────────────────────────────────────────────────────────
-
   /**
    * Apply globalOptions to the synthesizer.
    *
-   * @param setLanguage  Pass true only during init / engine switch / reset.
+   * @param setLanguage Pass true only during init / engine switch / reset.
    *                     Calling setLanguage() on non-Google engines tears down
    *                     the utterance listener internally, so we avoid it
    *                     during normal queue processing.
@@ -268,9 +301,9 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         if (listenerSet) attachUtteranceListener()
       }
     }
-    globalOptions["pitch"]?.let  { synthesizer.setPitch((it as? Number)?.toFloat() ?: 1.0f) }
-    globalOptions["rate"]?.let   { synthesizer.setSpeechRate((it as? Number)?.toFloat() ?: 0.5f) }
-    globalOptions["voice"]?.let  { voiceId ->
+    globalOptions["pitch"]?.let { synthesizer.setPitch((it as? Number)?.toFloat() ?: 1.0f) }
+    globalOptions["rate"]?.let { synthesizer.setSpeechRate((it as? Number)?.toFloat() ?: 0.5f) }
+    globalOptions["voice"]?.let { voiceId ->
       synthesizer.voices?.find { it.name == voiceId }?.let { synthesizer.voice = it }
     }
   }
@@ -284,8 +317,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     val opts = globalOptions.toMutableMap().apply { putAll(item.options) }
 
     // Rate / pitch — safe to set per-utterance, do not reset the listener
-    synthesizer.setSpeechRate((opts["rate"]  as? Number)?.toFloat() ?: 0.5f)
-    synthesizer.setPitch(     (opts["pitch"] as? Number)?.toFloat() ?: 1.0f)
+    synthesizer.setSpeechRate((opts["rate"] as? Number)?.toFloat() ?: 0.5f)
+    synthesizer.setPitch((opts["pitch"] as? Number)?.toFloat() ?: 1.0f)
 
     // Voice
     (opts["voice"] as? String)?.let { voiceId ->
@@ -303,55 +336,123 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   private fun getValidatedOptions(options: ReadableMap): Map<String, Any> {
     val validated = globalOptions.toMutableMap()
-    if (options.hasKey("ducking"))  validated["ducking"]  = options.getBoolean("ducking")
-    if (options.hasKey("voice"))    options.getString("voice")?.let { validated["voice"] = it }
-    if (options.hasKey("language")) validated["language"] = options.getString("language") ?: Locale.getDefault().toLanguageTag()
-    if (options.hasKey("pitch"))    validated["pitch"]    = options.getDouble("pitch").toFloat().coerceIn(0.1f, 2.0f)
-    if (options.hasKey("volume"))   validated["volume"]   = options.getDouble("volume").toFloat().coerceIn(0f, 1.0f)
-    if (options.hasKey("rate"))     validated["rate"]     = options.getDouble("rate").toFloat().coerceIn(0.1f, 2.0f)
+    if (options.hasKey("ducking")) validated["ducking"] = options.getBoolean("ducking")
+    if (options.hasKey("voice")) options.getString("voice")?.let { validated["voice"] = it }
+    if (options.hasKey("language")) validated["language"] =
+      options.getString("language") ?: Locale.getDefault().toLanguageTag()
+    if (options.hasKey("pitch")) validated["pitch"] =
+      options.getDouble("pitch").toFloat().coerceIn(0.1f, 2.0f)
+    if (options.hasKey("volume")) validated["volume"] =
+      options.getDouble("volume").toFloat().coerceIn(0f, 1.0f)
+    if (options.hasKey("rate")) validated["rate"] =
+      options.getDouble("rate").toFloat().coerceIn(0.1f, 2.0f)
     return validated
   }
 
   // ────────────────────────────────────────────────────────────────────────
   // Queue processing
   // ────────────────────────────────────────────────────────────────────────
-
+  /**
+   * THE KEY FIX: the actual synthesizer.speak() call now happens OUTSIDE
+   * queueLock. Only the bookkeeping (picking the next item, computing its
+   * params/text, advancing currentQueueIndex) happens under the lock. This
+   * way, if speak() ever hangs on a half-connected engine, it can't block
+   * stop()/pause()/speak() calls from other threads that also need
+   * queueLock.
+   *
+   * A watchdog is armed right after the speak() call: if onStart doesn't
+   * fire within WATCHDOG_TIMEOUT_MS, we assume the engine connection is
+   * stuck and force a full teardown/rebuild instead of waiting forever.
+   */
   private fun processNextQueueItem() {
+    var itemToSpeak: SpeechQueueItem? = null
+    var paramsToUse: Bundle? = null
+    var textToSpeak: String? = null
+    var queueModeToUse = TextToSpeech.QUEUE_ADD
+    var recurse = false
+    var applyDefaults = false
+
     synchronized(queueLock) {
       if (isPaused) return
 
       if (currentQueueIndex in 0 until speechQueue.size) {
         val item = speechQueue[currentQueueIndex]
-
         when (item.status) {
           SpeechStatus.PENDING, SpeechStatus.PAUSED -> {
             // Build params (sets rate/pitch/voice — NOT setLanguage)
             val params = buildParamsForItem(item)
 
-            val textToSpeak: String
+            val text: String
             if (item.status == SpeechStatus.PAUSED) {
               item.offset = item.position
-              textToSpeak = item.text.substring(item.offset)
-              isResuming  = true
+              text = item.text.substring(item.offset)
+              isResuming = true
             } else {
               item.offset = 0
-              textToSpeak = item.text
+              text = item.text
             }
 
-            val queueMode = if (isResuming) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-            synthesizer.speak(textToSpeak, queueMode, params, item.utteranceId)
+            itemToSpeak = item
+            paramsToUse = params
+            textToSpeak = text
+            queueModeToUse = if (isResuming) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
           }
           else -> {
             currentQueueIndex++
-            processNextQueueItem()
+            recurse = true
           }
         }
       } else {
         currentQueueIndex = -1
-        // Restore global defaults (rate/pitch only — no setLanguage)
-        applyGlobalOptions(setLanguage = false)
+        applyDefaults = true
       }
     }
+
+    if (recurse) {
+      processNextQueueItem()
+      return
+    }
+
+    if (applyDefaults) {
+      // Restore global defaults (rate/pitch only — no setLanguage)
+      applyGlobalOptions(setLanguage = false)
+      return
+    }
+
+    val item = itemToSpeak ?: return
+    val generationAtCallTime = initGeneration
+
+    // Call into the engine OUTSIDE queueLock.
+    synthesizer.speak(textToSpeak, queueModeToUse, paramsToUse, item.utteranceId)
+    armSpeakWatchdog(item.utteranceId, generationAtCallTime)
+  }
+
+  /**
+   * If onStart hasn't fired for this utteranceId within WATCHDOG_TIMEOUT_MS,
+   * the engine connection is presumed stuck (the classic "voices loaded but
+   * speak() never actually starts" state after an engine switch). Force a
+   * full teardown/rebuild rather than leaving the queue wedged forever.
+   */
+  private fun armSpeakWatchdog(utteranceId: String, generation: Int) {
+    mainHandler.postDelayed({
+      if (generation != initGeneration) return@postDelayed // engine already rebuilt, stale watchdog
+
+      val stuckItem = synchronized(queueLock) {
+        speechQueue.find { it.utteranceId == utteranceId && it.status == SpeechStatus.PENDING }
+      }
+
+      if (stuckItem != null) {
+        Log.e(
+          TAG,
+          "Watchdog: no onStart for utterance $utteranceId within ${WATCHDOG_TIMEOUT_MS}ms — " +
+            "engine appears stuck (half-connected after switch?), forcing rebuild"
+        )
+        stuckItem.status = SpeechStatus.ERROR
+        deactivateDuckingSession()
+        emitOnError(eventData(utteranceId))
+        teardownAndReinitialize()
+      }
+    }, WATCHDOG_TIMEOUT_MS)
   }
 
   private fun pruneCompletedItems() {
@@ -363,7 +464,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     synchronized(queueLock) {
       speechQueue.clear()
       currentQueueIndex = -1
-      isPaused   = false
+      isPaused = false
       isResuming = false
     }
   }
@@ -371,24 +472,19 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   // ────────────────────────────────────────────────────────────────────────
   // Pending operations
   // ────────────────────────────────────────────────────────────────────────
-
   private fun ensureInitialized(promise: Promise, operation: () -> Unit) {
     when {
       isInitialized -> {
-        try { operation() }
-        catch (e: Exception) { promise.reject("speech_error", e.message ?: "Unknown error") }
+        try {
+          operation()
+        } catch (e: Exception) {
+          promise.reject("speech_error", e.message ?: "Unknown error")
+        }
       }
       isInitializing -> pendingOperations.add(Pair(operation, promise))
-       else -> {
+      else -> {
         pendingOperations.add(Pair(operation, promise))
-        if (::synthesizer.isInitialized) {
-          try { synthesizer.stop(); synthesizer.shutdown() } catch (_: Exception) {}
-        }
-        initGeneration++
-        isInitialized  = false
-        isInitializing = false
-        resetQueueState()
-        initializeTTS()
+        teardownAndReinitialize()
       }
     }
   }
@@ -397,8 +493,11 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     val ops = ArrayList(pendingOperations)
     pendingOperations.clear()
     for ((op, promise) in ops) {
-      try { op() }
-      catch (e: Exception) { promise.reject("speech_error", e.message ?: "Unknown error") }
+      try {
+        op()
+      } catch (e: Exception) {
+        promise.reject("speech_error", e.message ?: "Unknown error")
+      }
     }
   }
 
@@ -411,11 +510,9 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   // ────────────────────────────────────────────────────────────────────────
   // Audio focus / ducking
   // ────────────────────────────────────────────────────────────────────────
-
   private fun activateDuckingSession() {
     if (!isDucking) return
     audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener {}
-
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       val attrs = AudioAttributes.Builder()
         .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
@@ -446,22 +543,21 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       audioManager.abandonAudioFocus(audioFocusChangeListener)
     }
     audioFocusChangeListener = null
-    audioFocusRequest        = null
+    audioFocusRequest = null
   }
 
   // ────────────────────────────────────────────────────────────────────────
   // Helpers
   // ────────────────────────────────────────────────────────────────────────
-
   private fun eventData(utteranceId: String): ReadableMap =
     Arguments.createMap().apply { putInt("id", utteranceId.hashCode()) }
 
   private fun voiceItem(voice: Voice): ReadableMap =
     Arguments.createMap().apply {
-      putString("quality",    if (voice.quality > Voice.QUALITY_NORMAL) "Enhanced" else "Default")
-      putString("name",       voice.name)
+      putString("quality", if (voice.quality > Voice.QUALITY_NORMAL) "Enhanced" else "Default")
+      putString("name", voice.name)
       putString("identifier", voice.name)
-      putString("language",   voice.locale.toLanguageTag())
+      putString("language", voice.locale.toLanguageTag())
     }
 
   private fun uniqueId(): String = UUID.randomUUID().toString()
@@ -469,7 +565,6 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   // ────────────────────────────────────────────────────────────────────────
   // Public API — NativeSpeechSpec overrides
   // ────────────────────────────────────────────────────────────────────────
-
   override fun initialize(options: ReadableMap) {
     val newOptions = globalOptions.toMutableMap()
     newOptions.putAll(getValidatedOptions(options))
@@ -484,7 +579,9 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   }
 
   override fun speak(text: String?, promise: Promise) {
-    if (text == null) { promise.reject("speech_error", "Text cannot be null"); return }
+    if (text == null) {
+      promise.reject("speech_error", "Text cannot be null"); return
+    }
     if (text.length > maxInputLength) {
       promise.reject("speech_error", "Text exceeds max length of $maxInputLength")
       return
@@ -492,22 +589,23 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     ensureInitialized(promise) {
       isDucking = globalOptions["ducking"] as? Boolean ?: false
       activateDuckingSession()
-
       val item = SpeechQueueItem(text = text, options = emptyMap(), utteranceId = uniqueId())
       synchronized(queueLock) {
         if (!synthesizer.isSpeaking && !isPaused) pruneCompletedItems()
         speechQueue.add(item)
         if (!synthesizer.isSpeaking && !isPaused) {
           currentQueueIndex = speechQueue.size - 1
-          processNextQueueItem()
         }
       }
+      processNextQueueItem()
       promise.resolve(null)
     }
   }
 
   override fun speakWithOptions(text: String?, options: ReadableMap, promise: Promise) {
-    if (text == null) { promise.reject("speech_error", "Text cannot be null"); return }
+    if (text == null) {
+      promise.reject("speech_error", "Text cannot be null"); return
+    }
     if (text.length > maxInputLength) {
       promise.reject("speech_error", "Text exceeds max length of $maxInputLength")
       return
@@ -516,16 +614,15 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       val validatedOptions = getValidatedOptions(options)
       isDucking = validatedOptions["ducking"] as? Boolean ?: false
       activateDuckingSession()
-
       val item = SpeechQueueItem(text = text, options = validatedOptions, utteranceId = uniqueId())
       synchronized(queueLock) {
         if (!synthesizer.isSpeaking && !isPaused) pruneCompletedItems()
         speechQueue.add(item)
         if (!synthesizer.isSpeaking && !isPaused) {
           currentQueueIndex = speechQueue.size - 1
-          processNextQueueItem()
         }
       }
+      processNextQueueItem()
       promise.resolve(null)
     }
   }
@@ -565,18 +662,23 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         promise.resolve(false)
         return@ensureInitialized
       }
+      var shouldProcess = false
       synchronized(queueLock) {
         val pausedIdx = speechQueue.indexOfFirst { it.status == SpeechStatus.PAUSED }
         if (pausedIdx >= 0) {
           currentQueueIndex = pausedIdx
           isPaused = false
-          activateDuckingSession()
-          processNextQueueItem()
-          promise.resolve(true)
+          shouldProcess = true
         } else {
           isPaused = false
-          promise.resolve(false)
         }
+      }
+      if (shouldProcess) {
+        activateDuckingSession()
+        processNextQueueItem()
+        promise.resolve(true)
+      } else {
+        promise.resolve(false)
       }
     }
   }
@@ -589,10 +691,11 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   override fun getAvailableVoices(language: String?, promise: Promise) {
     ensureInitialized(promise) {
-      val arr    = Arguments.createArray()
+      val arr = Arguments.createArray()
       val voices = synthesizer.voices
-      if (voices == null) { promise.resolve(arr); return@ensureInitialized }
-
+      if (voices == null) {
+        promise.resolve(arr); return@ensureInitialized
+      }
       if (language != null) {
         val lang = language.lowercase()
         voices.forEach { v ->
@@ -610,8 +713,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       val arr = Arguments.createArray()
       cachedEngines?.forEach { engine ->
         arr.pushMap(Arguments.createMap().apply {
-          putString("name",      engine.name)
-          putString("label",     engine.label)
+          putString("name", engine.name)
+          putString("label", engine.label)
           putBoolean("isDefault", engine.name == synthesizer.defaultEngine)
         })
       }
@@ -632,21 +735,15 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     }
     if (isInitialized) {
       val active = selectedEngine ?: synthesizer.defaultEngine
-      if (active == engineName) { promise.resolve(null); return }
+      if (active == engineName) {
+        promise.resolve(null); return
+      }
     }
-
-    if (::synthesizer.isInitialized) {
-      try { synthesizer.stop(); synthesizer.shutdown() }
-      catch (e: Exception) { Log.w(TAG, "Error shutting down TTS before engine switch", e) }
-    }
-
-    initGeneration++
+    // Set the target engine BEFORE tearing down: teardownAndReinitialize()
+    // schedules initializeTTS() after a short delay, and initializeTTS()
+    // reads selectedEngine at that point.
     selectedEngine = engineName
-    isInitialized  = false
-    isInitializing = false
-    listenerSet    = false
-    resetQueueState()
-    initializeTTS()
+    teardownAndReinitialize()
     promise.resolve(null)
   }
 
@@ -672,13 +769,14 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   override fun invalidate() {
     super.invalidate()
     mainHandler.removeCallbacksAndMessages(null)
+    initGeneration++ // invalidate any pending watchdogs/callbacks
     if (::synthesizer.isInitialized) {
       synthesizer.stop()
       synthesizer.shutdown()
       resetQueueState()
     }
-    isInitialized  = false
+    isInitialized = false
     isInitializing = false
-    listenerSet    = false
+    listenerSet = false
   }
 }
