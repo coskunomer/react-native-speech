@@ -45,6 +45,16 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     // actually wired up.
     private const val ENGINE_REINIT_DELAY_MS = 300L
 
+    // How many consecutive failures we tolerate on the SAME named engine
+    // before we stop hammering it and fall back to the system default.
+    private const val MAX_ENGINE_FAILURES = 2
+
+    // Hard backstop across engine switches. If we still can't get a single
+    // successful onStart after this many total failures (even after having
+    // fallen back to the default engine), we stop the automatic rebuild loop
+    // entirely instead of silently retrying forever.
+    private const val MAX_TOTAL_FAILURES = 4
+
     private val defaultOptions: Map<String, Any> = mapOf(
       "rate" to 0.5f,
       "pitch" to 1.0f,
@@ -79,6 +89,23 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   private var currentQueueIndex = -1
   private var isPaused = false
   private var isResuming = false
+
+  // If a teardown/reinit was triggered by an engine FAILURE (as opposed to a
+  // manual stop() or setEngine()), we want to resume the existing queue once
+  // the new engine instance is ready, instead of wiping it.
+  private var pendingQueueResume = false
+
+  // ── Engine health tracking ───────────────────────────────────────────────
+  // FIX: previously, a failed speak() or a stuck watchdog would silently
+  // drop the utterance and rebuild the SAME engine forever (fatal on engines
+  // like Huawei's, which reject speak() synchronously and consistently), or
+  // would rebuild but never inform JS that anything went wrong (the only
+  // failure signal, onError, was only listened to for paragraph-reading
+  // state on the JS side). This map + the "dead" flag give us a bounded,
+  // observable retry policy instead of an infinite silent loop.
+  private val engineFailureCounts = mutableMapOf<String, Int>()
+  private var totalConsecutiveFailures = 0
+  private var engineDead = false
 
   // ── Audio focus ──────────────────────────────────────────────────────────
   private val audioManager: AudioManager by lazy {
@@ -129,8 +156,15 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
    * real (PackageManager-backed, not binder-backed) data. Waiting a beat
    * before reconstructing reduces the odds of landing in that half-connected
    * state.
+   *
+   * @param preserveQueue FIX: when true (engine-failure recovery), the
+   *   pending speech queue is kept intact and resumed automatically once the
+   *   new engine reports ready. Previously this method ALWAYS wiped the
+   *   queue via resetQueueState(), which meant any auto-recovery attempt
+   *   silently threw away the utterance that was being spoken — the text
+   *   was gone forever even when the rebuild succeeded.
    */
-  private fun teardownAndReinitialize() {
+  private fun teardownAndReinitialize(preserveQueue: Boolean = false) {
     if (::synthesizer.isInitialized) {
       try {
         synthesizer.stop()
@@ -143,7 +177,14 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     isInitialized = false
     isInitializing = false
     listenerSet = false
-    resetQueueState()
+
+    if (preserveQueue) {
+      pendingQueueResume = true
+      synchronized(queueLock) { isPaused = false }
+    } else {
+      pendingQueueResume = false
+      resetQueueState()
+    }
 
     mainHandler.postDelayed({
       initializeTTS()
@@ -177,6 +218,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
           isInitialized = true
           isInitializing = false
           processPendingOperations()
+          // FIX: resume the queue after an engine-failure rebuild instead of
+          // requiring a fresh speak() call from JS to notice anything is
+          // playable again.
+          if (pendingQueueResume) {
+            pendingQueueResume = false
+            processNextQueueItem()
+          }
         } else if (retryCount < maxRetries) {
           Log.w(TAG, "TTS not ready (retry ${retryCount + 1}/$maxRetries)")
           verifyTTSReady(retryCount + 1, generation)
@@ -209,6 +257,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   private fun attachUtteranceListener() {
     synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
       override fun onStart(utteranceId: String) {
+        // FIX: a successful onStart is proof the current engine is actually
+        // working end-to-end. Clear failure tracking so a one-off transient
+        // failure doesn't count against a since-recovered engine.
+        val engineName = selectedEngine ?: synthesizer.defaultEngine
+        if (engineName != null) engineFailureCounts.remove(engineName)
+        totalConsecutiveFailures = 0
+
         synchronized(queueLock) {
           speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
             item.status = SpeechStatus.SPEAKING
@@ -438,9 +493,9 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     Log.d(TAG, "speak() returned $result")
 
     if (result == TextToSpeech.ERROR) {
-        Log.e(TAG, "Huawei immediately rejected speak()")
-        teardownAndReinitialize()
-        return
+      Log.e(TAG, "speak() rejected synchronously by engine")
+      handleEngineFailure(item, "speak_rejected")
+      return
     }
     armSpeakWatchdog(item.utteranceId, generationAtCallTime)
   }
@@ -465,12 +520,78 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
           "Watchdog: no onStart for utterance $utteranceId within ${WATCHDOG_TIMEOUT_MS}ms — " +
             "engine appears stuck (half-connected after switch?), forcing rebuild"
         )
-        stuckItem.status = SpeechStatus.ERROR
-        deactivateDuckingSession()
-        emitOnError(eventData(utteranceId))
-        teardownAndReinitialize()
+        handleEngineFailure(stuckItem, "watchdog_timeout")
       }
     }, WATCHDOG_TIMEOUT_MS)
+  }
+
+  /**
+   * FIX: centralizes what used to be two divergent, both-broken failure
+   * paths (the synchronous ERROR branch in processNextQueueItem, and the
+   * watchdog timeout). Previously both would:
+   *   1. Call teardownAndReinitialize(), which wiped the ENTIRE queue,
+   *      silently discarding the utterance that failed — and anything
+   *      queued behind it.
+   *   2. Rebuild using the SAME selectedEngine, so a consistently-broken
+   *      engine (e.g. Huawei's, which rejects speak() synchronously every
+   *      time) would repeat this forever, every ~4 seconds, with no way for
+   *      JS to ever find out or offer the user a different engine.
+   *
+   * Now:
+   *   - The failing item is kept (not dropped) and retried once after a
+   *     rebuild of the SAME engine, in case it was a transient hiccup.
+   *   - If the same engine fails twice in a row, we give up on it, notify
+   *     JS via onError with reason="engine_unavailable", and fall back to
+   *     the system default engine (selectedEngine = null) instead of
+   *     retrying the same broken one indefinitely.
+   *   - If failures keep happening even after falling back (or there's
+   *     nowhere left to fall back to), a hard backstop
+   *     (MAX_TOTAL_FAILURES) stops the automatic rebuild loop entirely and
+   *     marks the engine "dead" — any further speak() calls reject
+   *     immediately with a clear message instead of silently queuing
+   *     forever, until the caller explicitly calls reset() or setEngine().
+   */
+  private fun handleEngineFailure(item: SpeechQueueItem, reason: String) {
+    val engineName = selectedEngine ?: (if (::synthesizer.isInitialized) synthesizer.defaultEngine else null) ?: "unknown"
+    val engineFailures = (engineFailureCounts[engineName] ?: 0) + 1
+    engineFailureCounts[engineName] = engineFailures
+    totalConsecutiveFailures++
+
+    Log.e(
+      TAG,
+      "Engine '$engineName' failed ($reason). " +
+        "consecutiveForEngine=$engineFailures totalConsecutive=$totalConsecutiveFailures"
+    )
+
+    if (totalConsecutiveFailures >= MAX_TOTAL_FAILURES) {
+      synchronized(queueLock) { item.status = SpeechStatus.ERROR }
+      deactivateDuckingSession()
+      emitOnError(errorEventData(item.utteranceId, reason = "engine_dead", engine = engineName))
+      engineDead = true
+      rejectPendingOperations()
+      resetQueueState()
+      return
+    }
+
+    if (engineFailures < MAX_ENGINE_FAILURES) {
+      // Transient — put the item back at the front of the line and rebuild
+      // the same engine.
+      synchronized(queueLock) { item.status = SpeechStatus.PENDING }
+      teardownAndReinitialize(preserveQueue = true)
+    } else {
+      // This engine looks consistently broken. Give up on it, tell JS why,
+      // and fall back to whatever the system default is instead of looping
+      // on the same dead engine.
+      synchronized(queueLock) {
+        item.status = SpeechStatus.ERROR
+        if (!isPaused) currentQueueIndex++
+      }
+      deactivateDuckingSession()
+      emitOnError(errorEventData(item.utteranceId, reason = "engine_unavailable", engine = engineName))
+      engineFailureCounts.remove(engineName)
+      selectedEngine = null
+      teardownAndReinitialize(preserveQueue = true)
+    }
   }
 
   private fun pruneCompletedItems() {
@@ -491,6 +612,17 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   // Pending operations
   // ────────────────────────────────────────────────────────────────────────
   private fun ensureInitialized(promise: Promise, operation: () -> Unit) {
+    // FIX: without this check, a permanently broken engine (see
+    // handleEngineFailure) would just keep getting re-queued and re-tried
+    // via the `else` branch below forever, on every single call, with the
+    // caller never finding out. Now we fail fast and loudly instead.
+    if (engineDead) {
+      promise.reject(
+        "speech_error",
+        "TTS engine is unavailable after repeated failures; call reset() or setEngine() to retry"
+      )
+      return
+    }
     when {
       isInitialized -> {
         try {
@@ -570,6 +702,20 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   private fun eventData(utteranceId: String): ReadableMap =
     Arguments.createMap().apply { putInt("id", utteranceId.hashCode()) }
 
+  // FIX: previously emitOnError only ever carried the utterance id, giving
+  // JS no way to distinguish "this one utterance failed" from "the engine
+  // itself is unusable" — which is why the JS onError listener could never
+  // do anything useful beyond resetting paragraph-reading state. The extra
+  // fields are additive (existing consumers reading only `id` are
+  // unaffected); on the JS side we read them via an `any`-typed callback
+  // parameter since the bundled TS defs don't know about them.
+  private fun errorEventData(utteranceId: String, reason: String, engine: String? = null): ReadableMap =
+    Arguments.createMap().apply {
+      putInt("id", utteranceId.hashCode())
+      putString("reason", reason)
+      engine?.let { putString("engine", it) }
+    }
+
   private fun voiceItem(voice: Voice): ReadableMap =
     Arguments.createMap().apply {
       putString("quality", if (voice.quality > Voice.QUALITY_NORMAL) "Enhanced" else "Default")
@@ -593,7 +739,24 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
 
   override fun reset() {
     globalOptions = defaultOptions.toMutableMap()
-    applyGlobalOptions(setLanguage = true)
+    // FIX: this used to call applyGlobalOptions(setLanguage = true)
+    // unconditionally, touching `synthesizer` directly. reset() has no
+    // Promise, so JS calls it fire-and-forget — including, per the JS
+    // reinitializeTTS() flow, potentially WHILE a teardownAndReinitialize()
+    // is mid-flight (old instance already shut down, new one not
+    // constructed yet). Calling setLanguage() on a shut-down TextToSpeech
+    // instance at that moment is silently broken and was a real
+    // contributor to "the engine just doesn't come back" symptoms.
+    // Guard: only touch the live synthesizer if it's actually ready. If
+    // it's not, verifyTTSReady() will apply these (now-updated)
+    // globalOptions itself once the new instance comes up.
+    if (isInitialized && ::synthesizer.isInitialized) {
+      try {
+        applyGlobalOptions(setLanguage = true)
+      } catch (e: Exception) {
+        Log.w(TAG, "reset(): engine not actually ready, options will apply on next init", e)
+      }
+    }
   }
 
   override fun speak(text: String?, promise: Promise) {
@@ -714,6 +877,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
       if (voices == null) {
         promise.resolve(arr); return@ensureInitialized
       }
+
       if (language != null) {
         val lang = language.lowercase()
         voices.forEach { v ->
@@ -761,7 +925,14 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     // schedules initializeTTS() after a short delay, and initializeTTS()
     // reads selectedEngine at that point.
     selectedEngine = engineName
-    teardownAndReinitialize()
+    // FIX: an explicit engine switch is a deliberate user/app choice, so
+    // reset all failure bookkeeping — we don't want a previous engine's
+    // failure count (or a prior engineDead state) to linger and affect the
+    // newly-chosen engine.
+    engineDead = false
+    totalConsecutiveFailures = 0
+    engineFailureCounts.clear()
+    teardownAndReinitialize(preserveQueue = false)
     promise.resolve(null)
   }
 
@@ -796,5 +967,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     isInitialized = false
     isInitializing = false
     listenerSet = false
+    engineFailureCounts.clear()
+    totalConsecutiveFailures = 0
+    engineDead = false
   }
 }
