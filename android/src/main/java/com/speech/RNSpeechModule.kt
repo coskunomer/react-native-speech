@@ -132,7 +132,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     initializeTTS()
   }
 
-  private fun initializeTTS() {
+  private fun initializeTTS(preserveQueue: Boolean = false) {
     if (isInitializing) return
     isInitializing = true
 
@@ -144,7 +144,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
         Log.w(TAG, "Error shutting down TTS engine", e)
       }
     }
-    initGeneration++ 
+    initGeneration++
+    val myGen = initGeneration
     isInitialized = false
     isInitializing = false
     listenerSet = false
@@ -168,7 +169,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
         rejectPendingOperations()
       }
     }, selectedEngine)
-  }
+}
 
   private fun onEngineConstructed(generation: Int) {
     cachedEngines = synthesizer.engines
@@ -179,7 +180,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
 
   private fun teardownAndReinitialize(preserveQueue: Boolean = false) {
     mainHandler.postDelayed({
-      initializeTTS()
+      initializeTTS(preserveQueue)
     }, ENGINE_REINIT_DELAY_MS)
   }
 
