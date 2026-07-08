@@ -100,9 +100,9 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
     synthesizer = TextToSpeech(reactApplicationContext, { status ->
       if (myGen != initGeneration) return@TextToSpeech  // stale callback, ignore
-      if (status == TextToSpeech.SUCCESS) {
-        Log.d(TAG, "TTS engine callback SUCCESS, verifying voices…")
-        verifyTTSReady()
+        if (status == TextToSpeech.SUCCESS) {
+          Log.d(TAG, "TTS engine callback SUCCESS, verifying voices…")
+          verifyTTSReady(generation = myGen)
       } else {
         Log.e(TAG, "TTS engine init failed with status: $status")
         isInitialized  = false
@@ -118,7 +118,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
    *
    * Retries up to 20 times with escalating back-off (500 ms → 1 s → 2 s).
    */
-  private fun verifyTTSReady(retryCount: Int = 0) {
+  private fun verifyTTSReady(retryCount: Int = 0, generation: Int) {
     val maxRetries = 20
     val delay = when {
       retryCount == 0 -> 500L
@@ -127,7 +127,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     }
 
     mainHandler.postDelayed({
-      if (gen != initGeneration) return@postDelayed // superseded by a newer init
+      if (generation != initGeneration) return@postDelayed // superseded by a newer init
       try {
         val voices  = synthesizer.voices
         val engines = synthesizer.engines
@@ -135,10 +135,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         if (!voices.isNullOrEmpty() && !engines.isNullOrEmpty()) {
           Log.d(TAG, "TTS ready: ${voices.size} voices, ${engines.size} engines")
           cachedEngines = engines
-
-          // Attach listener once (or re-attach after an engine switch)
           attachUtteranceListener()
-
           applyGlobalOptions(setLanguage = true)
           isInitialized  = true
           isInitializing = false
@@ -146,7 +143,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
         } else if (retryCount < maxRetries) {
           Log.w(TAG, "TTS not ready (retry ${retryCount + 1}/$maxRetries)")
-          verifyTTSReady(retryCount + 1)
+          verifyTTSReady(retryCount + 1, generation)
         } else {
           Log.e(TAG, "TTS failed to become ready after $maxRetries retries")
           isInitialized  = false
@@ -155,7 +152,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         }
       } catch (e: Exception) {
         Log.e(TAG, "Exception during TTS verification (retry $retryCount)", e)
-        if (retryCount < maxRetries) verifyTTSReady(retryCount + 1)
+        if (retryCount < maxRetries) verifyTTSReady(retryCount + 1, generation)
         else {
           isInitialized  = false
           isInitializing = false
@@ -382,16 +379,14 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         catch (e: Exception) { promise.reject("speech_error", e.message ?: "Unknown error") }
       }
       isInitializing -> pendingOperations.add(Pair(operation, promise))
-      else -> {
+       else -> {
         pendingOperations.add(Pair(operation, promise))
         if (::synthesizer.isInitialized) {
           try { synthesizer.stop(); synthesizer.shutdown() } catch (_: Exception) {}
         }
-        initGeneration++          // invalidate any in-flight init immediately
-        selectedEngine = engineName
+        initGeneration++
         isInitialized  = false
         isInitializing = false
-        listenerSet    = false
         resetQueueState()
         initializeTTS()
       }
@@ -645,6 +640,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       catch (e: Exception) { Log.w(TAG, "Error shutting down TTS before engine switch", e) }
     }
 
+    initGeneration++
     selectedEngine = engineName
     isInitialized  = false
     isInitializing = false
