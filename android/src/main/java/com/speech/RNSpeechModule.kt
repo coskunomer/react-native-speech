@@ -124,6 +124,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   // Utterance id of an in-flight init-time connectivity probe, or null if
   // none outstanding. Only one is ever in flight at a time.
   private var pendingProbeUtteranceId: String? = null
+  private var pendingReinitRunnable: Runnable? = null
+
 
   // ────────────────────────────────────────────────────────────────────────
   // Init
@@ -133,7 +135,6 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   }
 
   private fun initializeTTS(preserveQueue: Boolean = false) {
-    if (isInitializing) return
     isInitializing = true
 
     if (::synthesizer.isInitialized) {
@@ -147,7 +148,6 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     initGeneration++
     val myGen = initGeneration
     isInitialized = false
-    isInitializing = false
     listenerSet = false
 
     if (preserveQueue) {
@@ -179,10 +179,11 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   }
 
   private fun teardownAndReinitialize(preserveQueue: Boolean = false) {
-    mainHandler.postDelayed({
-      initializeTTS(preserveQueue)
-    }, ENGINE_REINIT_DELAY_MS)
-  }
+    pendingReinitRunnable?.let { mainHandler.removeCallbacks(it) }
+    val runnable = Runnable { initializeTTS(preserveQueue) }
+    pendingReinitRunnable = runnable
+    mainHandler.postDelayed(runnable, ENGINE_REINIT_DELAY_MS)
+}
 
 /**
  * FIX (root cause): fires an inaudible canary utterance right after
@@ -236,7 +237,7 @@ private fun probeEngineConnectivity(generation: Int) {
       Log.w(TAG, "completeInitialization(): failed to (re)apply options", e)
     }
     isInitialized = true
-    isInitializing = false
+    isInitializing = false  
     engineFailureCounts.remove(selectedEngine ?: synthesizer.defaultEngine ?: "unknown")
     totalConsecutiveFailures = 0
     processPendingOperations()
@@ -971,23 +972,18 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
     if (isInitialized) {
       val active = selectedEngine ?: synthesizer.defaultEngine
       if (active == engineName) {
-        promise.resolve(null); return
+        selectedEngine = engineName
+        promise.resolve(null)
+        return
       }
     }
-    // Set the target engine BEFORE tearing down: teardownAndReinitialize()
-    // schedules initializeTTS() after a short delay, and initializeTTS()
-    // reads selectedEngine at that point.
     selectedEngine = engineName
-    // FIX: an explicit engine switch is a deliberate user/app choice, so
-    // reset all failure bookkeeping — we don't want a previous engine's
-    // failure count (or a prior engineDead state) to linger and affect the
-    // newly-chosen engine.
     engineDead = false
     totalConsecutiveFailures = 0
     engineFailureCounts.clear()
     teardownAndReinitialize(preserveQueue = false)
     promise.resolve(null)
-  }
+}
 
   override fun openVoiceDataInstaller(promise: Promise) {
     try {
