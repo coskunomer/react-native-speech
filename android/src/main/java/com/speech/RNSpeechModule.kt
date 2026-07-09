@@ -57,6 +57,54 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
 
     private const val PROBE_UTTERANCE_PREFIX = "connectivity-probe-"
 
+    // FIX: bounded retry for the "language data not warmed up yet" race.
+    // Right after the engine reports SUCCESS (and even after our
+    // connectivity probe confirms the binder is alive), TextToSpeech.
+    // setLanguage() can return LANG_MISSING_DATA / LANG_NOT_SUPPORTED for a
+    // locale that becomes available moments later — the probe only proves
+    // the connection is up, it says nothing about a specific locale's data
+    // being ready. Previously the return code was never checked, so speak()
+    // was called anyway with no language resolved, got synchronously
+    // rejected by the engine, and only "recovered" because the resulting
+    // failure-triggered full teardown/rebuild happened to buy enough time
+    // for the data to finish loading. These retries fix the actual race
+    // directly, without paying for a full engine rebuild every cold start.
+    //
+    // FIX: a flat 3x200ms budget (600ms total) was enough for Google's TTS
+    // engine but not for some OEM engines (observed: Huawei's hiai engine
+    // still returned LANG_MISSING_DATA after 600ms, and only actually
+    // resolved several seconds later — during which time a full, unrelated
+    // engine rebuild happened to occur and mask the real fix). Use
+    // exponential backoff with more attempts and a higher ceiling so slower
+    // engines get a realistic chance without over-delaying fast ones.
+    private const val MAX_LANGUAGE_RETRIES = 6
+    private const val LANGUAGE_RETRY_BASE_DELAY_MS = 150L
+    private const val LANGUAGE_RETRY_MAX_DELAY_MS = 2000L
+
+    /** attempt is 0-indexed (0 = first retry). Backs off 150ms, 300ms, 600ms,
+     * 1200ms, 2000ms(capped), 2000ms(capped) — roughly 6.2s of total budget
+     * across MAX_LANGUAGE_RETRIES attempts before giving up. */
+    private fun languageRetryDelayMs(attempt: Int): Long {
+      val exp = LANGUAGE_RETRY_BASE_DELAY_MS * (1L shl attempt)
+      return exp.coerceAtMost(LANGUAGE_RETRY_MAX_DELAY_MS)
+    }
+
+    // FIX: TextToSpeech(context, listener, requestedEnginePackage) can fail
+    // to bind the requested engine's service and silently fall back to the
+    // system default — while still reporting onInit == SUCCESS. This has
+    // been observed even when the requested engine is genuinely installed
+    // and listed in getEngines(): the bind can lose a race right after
+    // process/app cold start, or be blocked by OEM background-service
+    // restrictions (observed on a Huawei device where the system default
+    // was set to Huawei's own engine). The previous version of this code
+    // just accepted the silent fallback and corrected bookkeeping to match
+    // it — which "fixed" the symptom of misattributed failures, but never
+    // actually gave the requested engine (e.g. Google TTS) a real chance to
+    // bind. We now retry the FULL construction a bounded number of times
+    // before giving up and accepting the fallback.
+    private const val MAX_ENGINE_SWITCH_RETRIES = 3
+    private const val ENGINE_SWITCH_RETRY_DELAY_MS = 800L
+
     private val defaultOptions: Map<String, Any> = mapOf(
       "rate" to 0.5f,
       "pitch" to 1.0f,
@@ -97,16 +145,20 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   private var pendingQueueResume = false
 
   // ── Engine health tracking ───────────────────────────────────────────────
-  // FIX: previously, a failed speak() or a stuck watchdog would silently
-  // drop the utterance and rebuild the SAME engine forever (fatal on engines
-  // like Huawei's, which reject speak() synchronously and consistently), or
-  // would rebuild but never inform JS that anything went wrong (the only
-  // failure signal, onError, was only listened to for paragraph-reading
-  // state on the JS side). This map + the "dead" flag give us a bounded,
-  // observable retry policy instead of an infinite silent loop.
   private val engineFailureCounts = mutableMapOf<String, Int>()
   private var totalConsecutiveFailures = 0
   private var engineDead = false
+
+  // FIX: per-utterance retry counter for the setLanguage "data not ready
+  // yet" race. Keyed by utteranceId; cleaned up once the utterance leaves
+  // the queue (onStart / onDone / onError) so it can never leak.
+  private val languageRetryCounts = mutableMapOf<String, Int>()
+
+  // FIX: counts consecutive "requested engine not actually bound" mismatches
+  // for the CURRENT switch attempt. Reset to 0 whenever selectedEngine is
+  // set fresh by setEngine(), and whenever a construction actually lands on
+  // the requested engine. See MAX_ENGINE_SWITCH_RETRIES.
+  private var engineSwitchRetryCount = 0
 
   // ── Audio focus ──────────────────────────────────────────────────────────
   private val audioManager: AudioManager by lazy {
@@ -172,6 +224,58 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
 
   private fun onEngineConstructed(generation: Int) {
     cachedEngines = synthesizer.engines
+
+    // FIX: TextToSpeech(context, listener, requestedEnginePackage) does NOT
+    // fail or report a non-SUCCESS status if requestedEnginePackage can't
+    // actually be bound — it silently falls back to the real system default
+    // and still calls back with SUCCESS. Rather than accepting that on the
+    // first attempt (which just papers over a real, sometimes-transient
+    // binding race), retry the FULL engine construction up to
+    // MAX_ENGINE_SWITCH_RETRIES times. Only once retries are exhausted do we
+    // give up, correct our bookkeeping to the engine that's really bound,
+    // and tell JS the switch didn't stick.
+    val requestedEngine = selectedEngine
+    val actuallyBoundEngine = synthesizer.defaultEngine
+
+    if (requestedEngine != null && requestedEngine != actuallyBoundEngine) {
+      if (engineSwitchRetryCount < MAX_ENGINE_SWITCH_RETRIES) {
+        engineSwitchRetryCount++
+        Log.w(
+          TAG,
+          "Requested engine '$requestedEngine' did not bind (got '$actuallyBoundEngine' instead) — " +
+            "retrying construction in ${ENGINE_SWITCH_RETRY_DELAY_MS}ms " +
+            "(attempt $engineSwitchRetryCount/$MAX_ENGINE_SWITCH_RETRIES)"
+        )
+        // Keep selectedEngine as-is (still the real request) and rebuild.
+        // preserveQueue = true: this isn't a queue-affecting failure from
+        // JS's point of view, just a retry of engine construction itself.
+        pendingReinitRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable { initializeTTS(preserveQueue = true) }
+        pendingReinitRunnable = runnable
+        mainHandler.postDelayed(runnable, ENGINE_SWITCH_RETRY_DELAY_MS)
+        return
+      } else {
+        Log.w(
+          TAG,
+          "Requested engine '$requestedEngine' still not bound after " +
+            "$MAX_ENGINE_SWITCH_RETRIES retries — giving up on the switch and " +
+            "accepting the system's fallback to '$actuallyBoundEngine'."
+        )
+        emitOnError(
+          errorEventData(
+            uniqueId(),
+            reason = "engine_switch_failed",
+            engine = actuallyBoundEngine,
+            requestedEngine = requestedEngine,
+          )
+        )
+        selectedEngine = actuallyBoundEngine
+        engineSwitchRetryCount = 0
+      }
+    } else {
+      engineSwitchRetryCount = 0
+    }
+
     attachUtteranceListener()
     applyGlobalOptions(setLanguage = true)
     probeEngineConnectivity(generation)
@@ -194,6 +298,12 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
  * retry/fallback/give-up policy, automatically, before speak() is ever
  * called from JS. Previously that policy only ever triggered off of a
  * real, user-audible failed utterance.
+ *
+ * NOTE: this probe only proves the binder connection to the engine is
+ * alive via playSilentUtterance(), which requires no language data. It is
+ * NOT proof that a specific requested locale's voice data is ready — see
+ * the language-retry handling in buildParamsForItem/processNextQueueItem
+ * for that separate race.
  */
 private fun probeEngineConnectivity(generation: Int) {
   val id = PROBE_UTTERANCE_PREFIX + uniqueId()
@@ -297,6 +407,7 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
         val engineName = selectedEngine ?: synthesizer.defaultEngine
         if (engineName != null) engineFailureCounts.remove(engineName)
         totalConsecutiveFailures = 0
+        languageRetryCounts.remove(utteranceId)
 
         synchronized(queueLock) {
           speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
@@ -312,6 +423,7 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
       }
 
       override fun onDone(utteranceId: String) {
+        languageRetryCounts.remove(utteranceId)
         synchronized(queueLock) {
           speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
             item.status = SpeechStatus.COMPLETED
@@ -331,6 +443,7 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
           handleInitProbeFailure("speak_rejected", initGeneration)
           return
         }
+        languageRetryCounts.remove(utteranceId)
         synchronized(queueLock) {
           speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
             item.status = SpeechStatus.ERROR
@@ -386,28 +499,21 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
    *                     the utterance listener internally, so we avoid it
    *                     during normal queue processing.
    */
-  /**
- * FIX: each step here is independent (language / pitch / rate / voice) and
- * MUST be isolated from the others. Previously a thrown exception from
- * synthesizer.setLanguage() (some engines throw instead of returning
- * LANG_NOT_SUPPORTED/LANG_MISSING_DATA for certain locale tags — notably
- * the raw Locale.getDefault() tag used before JS ever calls initialize()
- * with a real language/voice) aborted the WHOLE function, silently
- * skipping voice/pitch/rate. That left the engine "initialized" with no
- * voice resolved at all, so speak() was rejected synchronously by the
- * engine (-1) on the very first attempt with a saved engine — recovering
- * only after the failure-triggered rebuild happened to run once
- * globalOptions had already been overwritten with real values from JS's
- * initializeSpeech() call. Each step is now wrapped separately so a
- * failure in one can't prevent the others from applying.
- */
 private fun applyGlobalOptions(setLanguage: Boolean = false) {
     if (setLanguage) {
       globalOptions["language"]?.let {
         try {
-          synthesizer.setLanguage(Locale.forLanguageTag(it as String))
+          val result = synthesizer.setLanguage(Locale.forLanguageTag(it as String))
+          if (result < TextToSpeech.LANG_AVAILABLE) {
+            // FIX: previously this result code was silently discarded. It's
+            // not fatal here (completeInitialization() re-applies options
+            // once the probe confirms the engine is live, and buildParamsForItem
+            // re-applies + retries at actual speak-time), but log it so the
+            // "not ready yet" race is visible instead of invisible.
+            Log.w(TAG, "applyGlobalOptions(): setLanguage('$it') -> result=$result (not ready)")
+          }
         } catch (e: Exception) {
-          Log.w(TAG, "applyGlobalOptions(): setLanguage('$it') failed, continuing with other options", e)
+          Log.w(TAG, "applyGlobalOptions(): setLanguage('$it') threw, continuing with other options", e)
         }
         // Re-attach regardless of whether setLanguage succeeded above —
         // setLanguage can orphan the listener on Samsung / AOSP TTS engines
@@ -435,31 +541,49 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
 }
 
   /**
+   * Result of building per-utterance TTS params.
+   *
+   * @param languageResult the raw TextToSpeech.setLanguage() return code
+   *   (or TextToSpeech.LANG_AVAILABLE if no language was requested for this
+   *   item). Callers MUST check this before calling speak() — see FIX note
+   *   on processNextQueueItem().
+   */
+  private data class BuiltSpeechParams(val bundle: Bundle, val languageResult: Int)
+
+  /**
    * Build a Bundle for a single queue item. Applies rate/pitch/voice per
    * utterance via direct setters (these are safe on all engines), but
-   * intentionally NEVER calls setLanguage() — that stays in applyGlobalOptions.
+   * intentionally NEVER calls setLanguage() at init time — that stays in
+   * applyGlobalOptions. It DOES call setLanguage() here at actual
+   * speak-time, since every real JS call sends `language` explicitly and
+   * this is the last point before speak() where it can be corrected.
+   *
+   * FIX (root cause of the bug being patched): setLanguage()'s return value
+   * is now surfaced to the caller instead of being silently discarded.
+   * TextToSpeech.setLanguage() does NOT throw for an unsupported / not-yet-
+   * loaded locale — it returns LANG_MISSING_DATA (-2) or LANG_NOT_SUPPORTED
+   * (-1). Previously only exceptions were caught, so a -2/-1 result was
+   * treated as success: speak() was then called with no language actually
+   * resolved, and Google's engine rejected it synchronously (-1). That
+   * failure only "recovered" because the resulting handleEngineFailure()
+   * teardown/rebuild happened to buy enough wall-clock time for the
+   * engine's locale data to finish loading — not a real fix. The caller
+   * (processNextQueueItem) now inspects languageResult and retries a few
+   * times with a short delay instead of speaking blind.
    */
-  private fun buildParamsForItem(item: SpeechQueueItem): Bundle {
+  private fun buildParamsForItem(item: SpeechQueueItem): BuiltSpeechParams {
     val opts = globalOptions.toMutableMap().apply { putAll(item.options) }
 
-    // FIX: language was previously only ever applied once, at init time, via
-    // applyGlobalOptions(setLanguage = true) — using whatever globalOptions
-    // held AT THAT MOMENT. If a queued speak (e.g. anything sitting in
-    // ensureInitialized's pendingOperations) fired via
-    // completeInitialization()'s processPendingOperations() BEFORE JS's own
-    // Speech.initialize()/speakWithOptions call had actually reached native
-    // with a real language/voice, the engine was left with language
-    // completely unset for that attempt — Google's engine then rejects
-    // speak() synchronously (-1). This "fixed itself" only because the
-    // resulting failure-triggered rebuild retried once globalOptions had
-    // caught up — not something we should rely on. Every real JS call
-    // already sends `language` explicitly, so apply it here too, at
-    // speak-time, independent of whether the earlier init-time apply landed.
+    var languageResult = TextToSpeech.LANG_AVAILABLE
     (opts["language"] as? String)?.let { langTag ->
-      try {
+      languageResult = try {
         synthesizer.setLanguage(Locale.forLanguageTag(langTag))
       } catch (e: Exception) {
-        Log.w(TAG, "buildParamsForItem(): setLanguage('$langTag') failed", e)
+        Log.w(TAG, "buildParamsForItem(): setLanguage('$langTag') threw", e)
+        TextToSpeech.LANG_NOT_SUPPORTED
+      }
+      if (languageResult < TextToSpeech.LANG_AVAILABLE) {
+        Log.w(TAG, "buildParamsForItem(): setLanguage('$langTag') -> result=$languageResult (not ready)")
       }
       // setLanguage can orphan the utterance listener on non-Google engines
       // (Samsung/AOSP) — same caveat as during init — re-attach immediately.
@@ -475,12 +599,13 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
       synthesizer.voices?.find { it.name == voiceId }?.let { synthesizer.voice = it }
     }
 
-    return Bundle().apply {
+    val bundle = Bundle().apply {
       putFloat(
         TextToSpeech.Engine.KEY_PARAM_VOLUME,
         (opts["volume"] as? Number)?.toFloat() ?: 1.0f
       )
     }
+    return BuiltSpeechParams(bundle, languageResult)
 }
 
   private fun getValidatedOptions(options: ReadableMap): Map<String, Any> {
@@ -512,10 +637,22 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
    * A watchdog is armed right after the speak() call: if onStart doesn't
    * fire within WATCHDOG_TIMEOUT_MS, we assume the engine connection is
    * stuck and force a full teardown/rebuild instead of waiting forever.
+   *
+   * FIX: before calling speak(), we now check the languageResult that came
+   * back from buildParamsForItem(). If the requested locale's data isn't
+   * ready yet (LANG_MISSING_DATA / LANG_NOT_SUPPORTED), we do NOT call
+   * speak() with a broken language — we reschedule this same item a few
+   * times with a short delay (MAX_LANGUAGE_RETRIES /
+   * LANGUAGE_RETRY_DELAY_MS) to let the engine finish loading the locale.
+   * Only if it's still not ready after those retries do we give up and
+   * speak anyway with best-effort language state, rather than looping
+   * forever or triggering a full, unrelated engine teardown for what is
+   * really just a brief data-loading race.
    */
   private fun processNextQueueItem() {
     var itemToSpeak: SpeechQueueItem? = null
     var paramsToUse: Bundle? = null
+    var languageResultForItem = TextToSpeech.LANG_AVAILABLE
     var textToSpeak: String? = null
     var queueModeToUse = TextToSpeech.QUEUE_ADD
     var recurse = false
@@ -528,8 +665,8 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
         val item = speechQueue[currentQueueIndex]
         when (item.status) {
           SpeechStatus.PENDING, SpeechStatus.PAUSED -> {
-            // Build params (sets rate/pitch/voice — NOT setLanguage)
-            val params = buildParamsForItem(item)
+            // Build params (sets rate/pitch/voice/language)
+            val built = buildParamsForItem(item)
 
             val text: String
             if (item.status == SpeechStatus.PAUSED) {
@@ -542,7 +679,8 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
             }
 
             itemToSpeak = item
-            paramsToUse = params
+            paramsToUse = built.bundle
+            languageResultForItem = built.languageResult
             textToSpeak = text
             queueModeToUse = if (isResuming) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
           }
@@ -569,6 +707,32 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
     }
 
     val item = itemToSpeak ?: return
+
+    // FIX: don't speak with an unresolved language — retry first.
+    if (languageResultForItem < TextToSpeech.LANG_AVAILABLE) {
+      val retries = languageRetryCounts.getOrDefault(item.utteranceId, 0)
+      if (retries < MAX_LANGUAGE_RETRIES) {
+        languageRetryCounts[item.utteranceId] = retries + 1
+        val delayMs = languageRetryDelayMs(retries)
+        Log.w(
+          TAG,
+          "Language not ready for utterance ${item.utteranceId} (result=$languageResultForItem) — " +
+            "retrying in ${delayMs}ms (attempt ${retries + 1}/$MAX_LANGUAGE_RETRIES)"
+        )
+        mainHandler.postDelayed({ processNextQueueItem() }, delayMs)
+        return
+      } else {
+        Log.w(
+          TAG,
+          "Language still not ready for utterance ${item.utteranceId} after $MAX_LANGUAGE_RETRIES " +
+            "retries — proceeding to speak anyway with best-effort language state"
+        )
+        languageRetryCounts.remove(item.utteranceId)
+      }
+    } else {
+      languageRetryCounts.remove(item.utteranceId)
+    }
+
     val generationAtCallTime = initGeneration
 
     Log.d(TAG, "engine=${synthesizer.defaultEngine}")
@@ -646,6 +810,7 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
    *     forever, until the caller explicitly calls reset() or setEngine().
    */
   private fun handleEngineFailure(item: SpeechQueueItem, reason: String) {
+    languageRetryCounts.remove(item.utteranceId)
     val engineName = selectedEngine ?: (if (::synthesizer.isInitialized) synthesizer.defaultEngine else null) ?: "unknown"
     val engineFailures = (engineFailureCounts[engineName] ?: 0) + 1
     engineFailureCounts[engineName] = engineFailures
@@ -700,6 +865,7 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
       isPaused = false
       isResuming = false
     }
+    languageRetryCounts.clear()
   }
 
   // ────────────────────────────────────────────────────────────────────────
@@ -803,11 +969,17 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
   // fields are additive (existing consumers reading only `id` are
   // unaffected); on the JS side we read them via an `any`-typed callback
   // parameter since the bundled TS defs don't know about them.
-  private fun errorEventData(utteranceId: String, reason: String, engine: String? = null): ReadableMap =
+  private fun errorEventData(
+    utteranceId: String,
+    reason: String,
+    engine: String? = null,
+    requestedEngine: String? = null,
+  ): ReadableMap =
     Arguments.createMap().apply {
       putInt("id", utteranceId.hashCode())
       putString("reason", reason)
       engine?.let { putString("engine", it) }
+      requestedEngine?.let { putString("requestedEngine", it) }
     }
 
   private fun voiceItem(voice: Voice): ReadableMap =
@@ -828,15 +1000,6 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
     newOptions.putAll(getValidatedOptions(options))
     globalOptions = newOptions
 
-    // FIX: previously called applyGlobalOptions(setLanguage = true)
-    // unconditionally. JS calls this fire-and-forget, and with the
-    // connectivity probe now extending rebuild latency, it's easy for this
-    // to land inside teardownAndReinitialize()'s window where `synthesizer`
-    // still points to an already-shutdown instance — silently broken, same
-    // failure mode reset() was already guarded against. globalOptions is
-    // updated above regardless, and completeInitialization() re-applies it
-    // once the probe actually confirms the engine is live, so a call landing
-    // mid-rebuild isn't lost — we just don't touch a dead object here.
     if (isInitialized && ::synthesizer.isInitialized) {
       try {
         applyGlobalOptions(setLanguage = true)
@@ -848,16 +1011,6 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
 
   override fun reset() {
     globalOptions = defaultOptions.toMutableMap()
-    // FIX: this used to call applyGlobalOptions(setLanguage = true)
-    // unconditionally, touching `synthesizer` directly. reset() has no
-    // Promise, so JS calls it fire-and-forget — including, per the JS
-    // reinitializeTTS() flow, potentially WHILE a teardownAndReinitialize()
-    // is mid-flight (old instance already shut down, new one not
-    // constructed yet). Calling setLanguage() on a shut-down TextToSpeech
-    // instance at that moment is silently broken and was a real
-    // contributor to "the engine just doesn't come back" symptoms.
-    // Guard: only touch the live synthesizer if it's actually ready. If
-    // globalOptions itself once the new instance comes up.
     if (isInitialized && ::synthesizer.isInitialized) {
       try {
         applyGlobalOptions(setLanguage = true)
@@ -1035,6 +1188,8 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
     engineDead = false
     totalConsecutiveFailures = 0
     engineFailureCounts.clear()
+    languageRetryCounts.clear()
+    engineSwitchRetryCount = 0
     teardownAndReinitialize(preserveQueue = false)
     promise.resolve(null)
 }
@@ -1073,5 +1228,7 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
     engineFailureCounts.clear()
     totalConsecutiveFailures = 0
     engineDead = false
+    languageRetryCounts.clear()
+    engineSwitchRetryCount = 0
   }
 }
