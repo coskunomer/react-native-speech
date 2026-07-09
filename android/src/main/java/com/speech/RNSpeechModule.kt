@@ -62,7 +62,6 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
       "pitch" to 1.0f,
       "volume" to 1.0f,
       "ducking" to false,
-      "language" to Locale.getDefault().toLanguageTag()
     )
   }
 
@@ -387,21 +386,53 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
    *                     the utterance listener internally, so we avoid it
    *                     during normal queue processing.
    */
-  private fun applyGlobalOptions(setLanguage: Boolean = false) {
+  /**
+ * FIX: each step here is independent (language / pitch / rate / voice) and
+ * MUST be isolated from the others. Previously a thrown exception from
+ * synthesizer.setLanguage() (some engines throw instead of returning
+ * LANG_NOT_SUPPORTED/LANG_MISSING_DATA for certain locale tags — notably
+ * the raw Locale.getDefault() tag used before JS ever calls initialize()
+ * with a real language/voice) aborted the WHOLE function, silently
+ * skipping voice/pitch/rate. That left the engine "initialized" with no
+ * voice resolved at all, so speak() was rejected synchronously by the
+ * engine (-1) on the very first attempt with a saved engine — recovering
+ * only after the failure-triggered rebuild happened to run once
+ * globalOptions had already been overwritten with real values from JS's
+ * initializeSpeech() call. Each step is now wrapped separately so a
+ * failure in one can't prevent the others from applying.
+ */
+private fun applyGlobalOptions(setLanguage: Boolean = false) {
     if (setLanguage) {
       globalOptions["language"]?.let {
-        synthesizer.setLanguage(Locale.forLanguageTag(it as String))
-        // Re-attach immediately: setLanguage can orphan the listener on
-        // Samsung / AOSP TTS engines.
+        try {
+          synthesizer.setLanguage(Locale.forLanguageTag(it as String))
+        } catch (e: Exception) {
+          Log.w(TAG, "applyGlobalOptions(): setLanguage('$it') failed, continuing with other options", e)
+        }
+        // Re-attach regardless of whether setLanguage succeeded above —
+        // setLanguage can orphan the listener on Samsung / AOSP TTS engines
+        // even when it doesn't throw.
         if (listenerSet) attachUtteranceListener()
       }
     }
-    globalOptions["pitch"]?.let { synthesizer.setPitch((it as? Number)?.toFloat() ?: 1.0f) }
-    globalOptions["rate"]?.let { synthesizer.setSpeechRate((it as? Number)?.toFloat() ?: 0.5f) }
-    globalOptions["voice"]?.let { voiceId ->
-      synthesizer.voices?.find { it.name == voiceId }?.let { synthesizer.voice = it }
+    try {
+      globalOptions["pitch"]?.let { synthesizer.setPitch((it as? Number)?.toFloat() ?: 1.0f) }
+    } catch (e: Exception) {
+      Log.w(TAG, "applyGlobalOptions(): setPitch failed", e)
     }
-  }
+    try {
+      globalOptions["rate"]?.let { synthesizer.setSpeechRate((it as? Number)?.toFloat() ?: 0.5f) }
+    } catch (e: Exception) {
+      Log.w(TAG, "applyGlobalOptions(): setSpeechRate failed", e)
+    }
+    try {
+      globalOptions["voice"]?.let { voiceId ->
+        synthesizer.voices?.find { it.name == voiceId }?.let { synthesizer.voice = it }
+      }
+    } catch (e: Exception) {
+      Log.w(TAG, "applyGlobalOptions(): setting voice failed", e)
+    }
+}
 
   /**
    * Build a Bundle for a single queue item. Applies rate/pitch/voice per
