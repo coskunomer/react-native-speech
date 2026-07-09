@@ -225,17 +225,20 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   private fun onEngineConstructed(generation: Int) {
     cachedEngines = synthesizer.engines
 
-    // FIX: TextToSpeech(context, listener, requestedEnginePackage) does NOT
-    // fail or report a non-SUCCESS status if requestedEnginePackage can't
-    // actually be bound — it silently falls back to the real system default
-    // and still calls back with SUCCESS. Rather than accepting that on the
-    // first attempt (which just papers over a real, sometimes-transient
-    // binding race), retry the FULL engine construction up to
-    // MAX_ENGINE_SWITCH_RETRIES times. Only once retries are exhausted do we
-    // give up, correct our bookkeeping to the engine that's really bound,
-    // and tell JS the switch didn't stick.
+    // FIX (real root cause): getDefaultEngine() returns the SYSTEM default
+    // engine configured in Settings — it has nothing to do with which
+    // engine this TextToSpeech instance actually bound to. Using it here
+    // meant this mismatch check was true any time we requested an engine
+    // other than the system default, EVEN WHEN THE BIND GENUINELY
+    // SUCCEEDED — so switching away from the OEM default (e.g. to Google
+    // TTS on a device whose system default is Huawei's engine) always
+    // looked like a failed switch, retried 3x pointlessly, then reverted
+    // `selectedEngine` back to the system default despite the real
+    // synthesizer instance correctly running the requested engine the
+    // whole time. getCurrentEngine() is the actual instance-bound engine
+    // and is what this comparison needs.
     val requestedEngine = selectedEngine
-    val actuallyBoundEngine = synthesizer.defaultEngine
+    val actuallyBoundEngine = synthesizer.currentEngine
 
     if (requestedEngine != null && requestedEngine != actuallyBoundEngine) {
       if (engineSwitchRetryCount < MAX_ENGINE_SWITCH_RETRIES) {
@@ -246,9 +249,6 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
             "retrying construction in ${ENGINE_SWITCH_RETRY_DELAY_MS}ms " +
             "(attempt $engineSwitchRetryCount/$MAX_ENGINE_SWITCH_RETRIES)"
         )
-        // Keep selectedEngine as-is (still the real request) and rebuild.
-        // preserveQueue = true: this isn't a queue-affecting failure from
-        // JS's point of view, just a retry of engine construction itself.
         pendingReinitRunnable?.let { mainHandler.removeCallbacks(it) }
         val runnable = Runnable { initializeTTS(preserveQueue = true) }
         pendingReinitRunnable = runnable
@@ -280,7 +280,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     applyGlobalOptions(setLanguage = true)
     probeEngineConnectivity(generation)
   }
-
+  
   private fun teardownAndReinitialize(preserveQueue: Boolean = false) {
     pendingReinitRunnable?.let { mainHandler.removeCallbacks(it) }
     val runnable = Runnable { initializeTTS(preserveQueue) }
@@ -359,7 +359,7 @@ private fun probeEngineConnectivity(generation: Int) {
 private fun handleInitProbeFailure(reason: String, generation: Int) {
   if (generation != initGeneration) return
 
-  val engineName = selectedEngine ?: (if (::synthesizer.isInitialized) synthesizer.defaultEngine else null) ?: "unknown"
+  val engineName = selectedEngine ?: (if (::synthesizer.isInitialized) synthesizer.currentEngine else null) ?: "unknown"
   val engineFailures = (engineFailureCounts[engineName] ?: 0) + 1
   engineFailureCounts[engineName] = engineFailures
   totalConsecutiveFailures++
@@ -407,7 +407,7 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
           completeInitialization(initGeneration)
           return
         }
-        val engineName = selectedEngine ?: synthesizer.defaultEngine
+        val engineName = selectedEngine ?: synthesizer.currentEngine
         if (engineName != null) engineFailureCounts.remove(engineName)
         totalConsecutiveFailures = 0
         languageRetryCounts.remove(utteranceId)
@@ -814,7 +814,7 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
    */
   private fun handleEngineFailure(item: SpeechQueueItem, reason: String) {
     languageRetryCounts.remove(item.utteranceId)
-    val engineName = selectedEngine ?: (if (::synthesizer.isInitialized) synthesizer.defaultEngine else null) ?: "unknown"
+    val engineName = selectedEngine ?: (if (::synthesizer.isInitialized) synthesizer.currentEngine else null) ?: "unknown"
     val engineFailures = (engineFailureCounts[engineName] ?: 0) + 1
     engineFailureCounts[engineName] = engineFailures
     totalConsecutiveFailures++
@@ -1174,9 +1174,13 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
     }
   }
 
+
   override fun getActiveEngine(promise: Promise) {
     ensureInitialized(promise) {
-      promise.resolve(selectedEngine ?: synthesizer.defaultEngine ?: "")
+      // FIX: same defaultEngine -> currentEngine correction — this is what
+      // JS calls to display "active engine" in the UI, so it must reflect
+      // reality, not the system default.
+      promise.resolve(selectedEngine ?: synthesizer.currentEngine ?: "")
     }
   }
 
