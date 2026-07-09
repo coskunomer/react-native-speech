@@ -356,8 +356,6 @@ private fun probeEngineConnectivity(generation: Int) {
     }
   }
 
-/** Same policy as handleEngineFailure(), but for the init-time probe — no
- * SpeechQueueItem exists yet, just engine-health bookkeeping. */
 private fun handleInitProbeFailure(reason: String, generation: Int) {
   if (generation != initGeneration) return
 
@@ -369,7 +367,7 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
   Log.e(TAG, "Init probe on '$engineName' failed ($reason). consecutiveForEngine=$engineFailures totalConsecutive=$totalConsecutiveFailures")
 
   if (totalConsecutiveFailures >= MAX_TOTAL_FAILURES) {
-    emitOnError(errorEventData(uniqueId(), reason = "engine_dead", engine = engineName))
+    emitOnError(errorEventData(uniqueId(), reason = "engine_dead", engine = engineName, trigger = reason))
     engineDead = true
     isInitializing = false
     rejectPendingOperations()
@@ -378,14 +376,19 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
   }
 
   if (engineFailures < MAX_ENGINE_FAILURES) {
+    // FIX: was silent. JS needs to see this to count consecutive
+    // watchdog_timeouts even while native is still treating it as
+    // transient-and-retryable.
+    emitOnError(errorEventData(uniqueId(), reason = "engine_retry", engine = engineName, trigger = reason))
     teardownAndReinitialize(preserveQueue = true)
   } else {
-    emitOnError(errorEventData(uniqueId(), reason = "engine_unavailable", engine = engineName))
+    emitOnError(errorEventData(uniqueId(), reason = "engine_unavailable", engine = engineName, trigger = reason))
     engineFailureCounts.remove(engineName)
     selectedEngine = null
     teardownAndReinitialize(preserveQueue = true)
   }
 }
+
 
   // ────────────────────────────────────────────────────────────────────────
   // Utterance listener
@@ -825,7 +828,7 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
     if (totalConsecutiveFailures >= MAX_TOTAL_FAILURES) {
       synchronized(queueLock) { item.status = SpeechStatus.ERROR }
       deactivateDuckingSession()
-      emitOnError(errorEventData(item.utteranceId, reason = "engine_dead", engine = engineName))
+      emitOnError(errorEventData(item.utteranceId, reason = "engine_dead", engine = engineName, trigger = reason))
       engineDead = true
       rejectPendingOperations()
       resetQueueState()
@@ -835,6 +838,9 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
     if (engineFailures < MAX_ENGINE_FAILURES) {
       // Transient — put the item back at the front of the line and rebuild
       // the same engine.
+      // FIX: was silent. Emit so JS can count this occurrence even though
+      // native is still treating it as recoverable-on-the-same-engine.
+      emitOnError(errorEventData(item.utteranceId, reason = "engine_retry", engine = engineName, trigger = reason))
       synchronized(queueLock) { item.status = SpeechStatus.PENDING }
       teardownAndReinitialize(preserveQueue = true)
     } else {
@@ -846,12 +852,13 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
         if (!isPaused) currentQueueIndex++
       }
       deactivateDuckingSession()
-      emitOnError(errorEventData(item.utteranceId, reason = "engine_unavailable", engine = engineName))
+      emitOnError(errorEventData(item.utteranceId, reason = "engine_unavailable", engine = engineName, trigger = reason))
       engineFailureCounts.remove(engineName)
       selectedEngine = null
       teardownAndReinitialize(preserveQueue = true)
     }
   }
+
 
   private fun pruneCompletedItems() {
     speechQueue.removeAll { it.status == SpeechStatus.COMPLETED || it.status == SpeechStatus.ERROR }
@@ -974,12 +981,14 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
     reason: String,
     engine: String? = null,
     requestedEngine: String? = null,
+    trigger: String? = null,
   ): ReadableMap =
     Arguments.createMap().apply {
       putInt("id", utteranceId.hashCode())
       putString("reason", reason)
       engine?.let { putString("engine", it) }
       requestedEngine?.let { putString("requestedEngine", it) }
+      trigger?.let { putString("trigger", it) }
     }
 
   private fun voiceItem(voice: Voice): ReadableMap =
