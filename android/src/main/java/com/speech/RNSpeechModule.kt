@@ -442,6 +442,30 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
   private fun buildParamsForItem(item: SpeechQueueItem): Bundle {
     val opts = globalOptions.toMutableMap().apply { putAll(item.options) }
 
+    // FIX: language was previously only ever applied once, at init time, via
+    // applyGlobalOptions(setLanguage = true) — using whatever globalOptions
+    // held AT THAT MOMENT. If a queued speak (e.g. anything sitting in
+    // ensureInitialized's pendingOperations) fired via
+    // completeInitialization()'s processPendingOperations() BEFORE JS's own
+    // Speech.initialize()/speakWithOptions call had actually reached native
+    // with a real language/voice, the engine was left with language
+    // completely unset for that attempt — Google's engine then rejects
+    // speak() synchronously (-1). This "fixed itself" only because the
+    // resulting failure-triggered rebuild retried once globalOptions had
+    // caught up — not something we should rely on. Every real JS call
+    // already sends `language` explicitly, so apply it here too, at
+    // speak-time, independent of whether the earlier init-time apply landed.
+    (opts["language"] as? String)?.let { langTag ->
+      try {
+        synthesizer.setLanguage(Locale.forLanguageTag(langTag))
+      } catch (e: Exception) {
+        Log.w(TAG, "buildParamsForItem(): setLanguage('$langTag') failed", e)
+      }
+      // setLanguage can orphan the utterance listener on non-Google engines
+      // (Samsung/AOSP) — same caveat as during init — re-attach immediately.
+      if (listenerSet) attachUtteranceListener()
+    }
+
     // Rate / pitch — safe to set per-utterance, do not reset the listener
     synthesizer.setSpeechRate((opts["rate"] as? Number)?.toFloat() ?: 0.5f)
     synthesizer.setPitch((opts["pitch"] as? Number)?.toFloat() ?: 1.0f)
@@ -451,14 +475,13 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
       synthesizer.voices?.find { it.name == voiceId }?.let { synthesizer.voice = it }
     }
 
-    // Volume goes into the Bundle (the only param that actually belongs there)
     return Bundle().apply {
       putFloat(
         TextToSpeech.Engine.KEY_PARAM_VOLUME,
         (opts["volume"] as? Number)?.toFloat() ?: 1.0f
       )
     }
-  }
+}
 
   private fun getValidatedOptions(options: ReadableMap): Map<String, Any> {
     val validated = globalOptions.toMutableMap()
