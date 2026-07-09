@@ -174,9 +174,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     cachedEngines = synthesizer.engines
     attachUtteranceListener()
     applyGlobalOptions(setLanguage = true)
-    logAllVoicesDetailed()   // TEMP
     probeEngineConnectivity(generation)
-}
+  }
 
   private fun teardownAndReinitialize(preserveQueue: Boolean = false) {
     pendingReinitRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -375,31 +374,6 @@ private fun handleInitProbeFailure(reason: String, generation: Int) {
     })
     listenerSet = true
   }
-
-
-  // TEMP DIAGNOSTIC — remove once the voice-download question is settled.
-private fun logAllVoicesDetailed() {
-    val voices = synthesizer.voices
-    if (voices == null) {
-      Log.d(TAG, "VOICE_DUMP: synthesizer.voices returned null")
-      return
-    }
-    Log.d(TAG, "VOICE_DUMP: engine=${selectedEngine ?: synthesizer.defaultEngine} count=${voices.size}")
-    voices.forEachIndexed { i, v ->
-      val notInstalled = v.features?.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) == true
-      Log.d(
-        TAG,
-        "VOICE_DUMP[$i] name=${v.name} " +
-          "locale=${v.locale.toLanguageTag()} " +
-          "quality=${v.quality} " +
-          "latency=${v.latency} " +
-          "isNetworkRequired=${v.isNetworkConnectionRequired} " +
-          "needsInternet=${v.isNetworkConnectionRequired} " +
-          "features=${v.features} " +
-          "notInstalled=$notInstalled"
-      )
-    }
-}
 
   // ────────────────────────────────────────────────────────────────────────
   // Options helpers
@@ -819,17 +793,6 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
       putString("name", voice.name)
       putString("identifier", voice.name)
       putString("language", voice.locale.toLanguageTag())
-      // FIX: some engines (notably Huawei's) enumerate voices whose data
-      // hasn't been downloaded yet. speak()-ing one of these is silently
-      // accepted but never actually synthesizes — no onStart/onDone/onError
-      // ever fires, which the watchdog eventually reports as a timeout with
-      // no way to tell it apart from a genuinely broken engine. Expose this
-      // so the JS layer can filter these out of voice selection or prompt a
-      // download instead of picking them as "best voice."
-      putBoolean(
-        "requiresDownload",
-        voice.features?.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) == true
-      )
     }
 
   private fun uniqueId(): String = UUID.randomUUID().toString()
@@ -999,17 +962,18 @@ private fun applyGlobalOptions(setLanguage: Boolean = false) {
       if (voices == null) {
         promise.resolve(arr); return@ensureInitialized
       }
-      val installedOnly = voices.filter {
-        it.features?.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) != true
-      }
-      val filtered = if (language != null) {
+
+      if (language != null) {
         val lang = language.lowercase()
-        installedOnly.filter { it.locale.toLanguageTag().lowercase().startsWith(lang) }
-      } else installedOnly
-      filtered.forEach { arr.pushMap(voiceItem(it)) }
+        voices.forEach { v ->
+          if (v.locale.toLanguageTag().lowercase().startsWith(lang)) arr.pushMap(voiceItem(v))
+        }
+      } else {
+        voices.forEach { arr.pushMap(voiceItem(it)) }
+      }
       promise.resolve(arr)
     }
-}
+  }
 
   override fun getEngines(promise: Promise) {
     ensureInitialized(promise) {
