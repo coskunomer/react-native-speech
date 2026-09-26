@@ -65,6 +65,10 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
   private val isSupportedPausing = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
   private val mainHandler = Handler(Looper.getMainLooper())
 
+  private val teardownExecutor = java.util.concurrent.Executors.newCachedThreadPool { r ->
+    Thread(r, "RNSpeech-teardown").apply { isDaemon = true }
+  }
+
   // ── TTS engine ───────────────────────────────────────────────────────────
   private lateinit var synthesizer: TextToSpeech
   private var selectedEngine: String? = null
@@ -142,11 +146,16 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     isInitializing = true
 
     if (::synthesizer.isInitialized) {
-      try {
-        synthesizer.stop()
-        synthesizer.shutdown()
-      } catch (e: Exception) {
-        Log.w(TAG, "Error shutting down TTS engine", e)
+      val oldSynthesizer = synthesizer
+      teardownExecutor.execute {
+        // shutdown() already calls stop() + disconnects internally, so we
+        // don't need to call stop() separately first — that was just a
+        // second avoidable acquisition of the same lock.
+        try {
+          oldSynthesizer.shutdown()
+        } catch (e: Exception) {
+          Log.w(TAG, "Error shutting down old TTS engine", e)
+        }
       }
     }
     initGeneration++
@@ -1065,8 +1074,10 @@ class RNSpeechModule(reactContext: ReactApplicationContext) : NativeSpeechSpec(r
     mainHandler.removeCallbacksAndMessages(null)
     initGeneration++
     if (::synthesizer.isInitialized) {
-      synthesizer.stop()
-      synthesizer.shutdown()
+      val oldSynthesizer = synthesizer
+      teardownExecutor.execute {
+        try { oldSynthesizer.shutdown() } catch (e: Exception) { Log.w(TAG, "shutdown on invalidate failed", e) }
+      }
       resetQueueState()
     }
     isInitialized = false
